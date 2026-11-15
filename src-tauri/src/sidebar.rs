@@ -163,8 +163,21 @@ fn dock_frame(host: Rect, screen: Rect, expanded: bool) -> Option<Rect> {
 struct Layout {
     expanded: bool,
     visible: bool,
+    hidden_reason: Option<&'static str>,
     target_id: Option<u32>,
     motion: MotionGate,
+}
+
+impl Layout {
+    fn hide(&mut self, host: Option<HostWindow>, reason: &'static str) {
+        self.expanded = false;
+        self.visible = false;
+        self.hidden_reason = Some(reason);
+        // A settling window is still our host. Keep it available if dismissing
+        // the badge leaves the accessory app in front. An unrelated app has no
+        // target and clears this association.
+        self.target_id = host.map(|host| host.id);
+    }
 }
 
 #[derive(Default)]
@@ -183,6 +196,7 @@ struct MotionGate {
     candidate: Option<HostWindow>,
     stable_since: Option<Instant>,
     accepted: Option<HostWindow>,
+    anchor_unsettled: bool,
     blocked_until: Option<Instant>,
 }
 
@@ -191,6 +205,7 @@ impl MotionGate {
         self.candidate = None;
         self.stable_since = None;
         self.accepted = None;
+        self.anchor_unsettled = false;
     }
 
     fn space_changed(&mut self, now: Instant) {
@@ -200,6 +215,12 @@ impl MotionGate {
 
     fn accepts(&mut self, host: HostWindow, mouse_down: bool, now: Instant) -> bool {
         let dragging_host = mouse_down && self.accepted.is_some_and(|last| last.id == host.id);
+        if self.accepted.is_some_and(|last| collapsed_frame(last.frame) != collapsed_frame(host.frame)) {
+            self.anchor_unsettled = true;
+        }
+        let same_anchor = !self.anchor_unsettled && self.accepted.is_some_and(|last| {
+            collapsed_frame(last.frame) == collapsed_frame(host.frame)
+        });
         if self.candidate != Some(host) {
             self.candidate = Some(host);
             self.stable_since = Some(now);
@@ -210,12 +231,16 @@ impl MotionGate {
         // WindowServer can report intermediate, horizontally translated bounds
         // during a Spaces swipe. Only a real mouse drag may track those changes
         // live; other movement must settle before we position or show the badge.
-        if dragging_host
+        // Switching chats can replace a native window without moving its rail.
+        // Its existing badge position is already safe, even if the ID or size
+        // changes. Explicit Space changes still take the blocked path above.
+        if dragging_host || same_anchor
             || self
                 .stable_since
                 .is_some_and(|since| now.duration_since(since) >= SETTLE_TIME)
         {
             self.accepted = Some(host);
+            self.anchor_unsettled = false;
             true
         } else {
             false
@@ -266,8 +291,31 @@ impl TargetScope {
     }
 }
 
-fn target_window(primary_screen_top: f64, retained_id: Option<u32>) -> Option<(HostWindow, i32)> {
-    let foreground = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+fn select_host_window(
+    windows: impl IntoIterator<Item = (HostWindow, i32)>,
+) -> Option<(HostWindow, i32)> {
+    // Project popovers and other transient surfaces also appear as layer-zero
+    // Codex windows. Browser/tool surfaces may be large enough to pass the size
+    // check, but sit inside the main window. Prefer their containing host, then
+    // retain front-to-back order between independent main windows. Identical
+    // frames are allowed while navigation replaces a native window.
+    let windows: Vec<_> = windows.into_iter().filter(|(window, _)| {
+        window.frame.width >= 480.0 && window.frame.height >= 360.0
+    }).collect();
+    windows.iter().copied().find(|(window, pid)| {
+        !windows.iter().any(|(other, other_pid)| {
+            other_pid == pid && other.frame != window.frame && other.frame.contains(window.frame)
+        })
+    })
+}
+
+fn target_window(
+    primary_screen_top: f64,
+    retained_id: Option<u32>,
+) -> Result<(HostWindow, i32), &'static str> {
+    let foreground = NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .ok_or("reason=foreground_app_unavailable")?;
     let pid = foreground.processIdentifier() as i64;
     let scope = target_scope(
         foreground
@@ -276,18 +324,20 @@ fn target_window(primary_screen_top: f64, retained_id: Option<u32>) -> Option<(H
         pid == i64::from(std::process::id()),
         pid,
         retained_id,
-    )?;
+    ).ok_or(if pid == i64::from(std::process::id()) {
+        "reason=widget_host_unavailable"
+    } else {
+        "reason=foreground_app_inactive"
+    })?;
     let windows = CGWindowListCopyWindowInfo(
         CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
         0,
-    )?;
+    ).ok_or("reason=window_list_unavailable")?;
     // WindowServer guarantees CFDictionary elements with CFType values.
     let windows =
         unsafe { CFRetained::cast_unchecked::<objc2_core_foundation::CFArray<CFType>>(windows) };
-    for entry in &*windows {
-        let Some(dict) = entry.downcast_ref::<CFDictionary>() else {
-            continue;
-        };
+    let candidates = windows.iter().filter_map(|entry| {
+        let dict = entry.downcast_ref::<CFDictionary>()?;
         // Window info dictionaries have CFString keys and CFType values.
         let dict = unsafe { dict.cast_unchecked::<CFString, CFType>() };
         // These constant keys belong to CoreGraphics and are immutable.
@@ -300,31 +350,26 @@ fn target_window(primary_screen_top: f64, retained_id: Option<u32>) -> Option<(H
             )
         };
         if !scope.matches(owner, id) || layer != Some(0) {
-            continue;
+            return None;
         }
         let owner_pid = i32::try_from(owner?).ok()?;
         if !NSRunningApplication::runningApplicationWithProcessIdentifier(owner_pid)
             .and_then(|application| application.bundleIdentifier())
             .is_some_and(|bundle| bundle.to_string() == "com.openai.codex")
         {
-            continue;
+            return None;
         }
         let bounds = bounds?.downcast::<CFDictionary>().ok()?;
         let mut rect = CGRect::ZERO;
         if !unsafe { CGRectMakeWithDictionaryRepresentation(Some(&bounds), &mut rect) } {
             return None;
         }
-        // The list is front-to-back. A small foremost window is a dialog or
-        // utility, so don't attach to a main window hidden behind that dialog.
-        if rect.size.width < 480.0 || rect.size.height < 360.0 {
-            return None;
-        }
-        return Some((HostWindow {
+        Some((HostWindow {
             id: u32::try_from(id?).ok()?,
             frame: from_window_server(rect, primary_screen_top),
-        }, owner_pid));
-    }
-    None
+        }, owner_pid))
+    });
+    select_host_window(candidates).ok_or("reason=main_window_unavailable")
 }
 
 /// Must run on the main thread. All AppKit access stays on that thread.
@@ -357,14 +402,18 @@ fn sync(app: &AppHandle) {
         let primary = primary.frame();
         primary.origin.y + primary.size.height
     });
-    let target = primary_top.and_then(|top| target_window(top, layout.target_id));
+    let resolution = primary_top
+        .ok_or("reason=display_unavailable")
+        .and_then(|top| target_window(top, layout.target_id));
+    let target = resolution.ok();
     state.tracking.store(target.is_some(), Ordering::Relaxed);
     if target.is_none() {
         layout.motion.clear_target();
         state.updates.clear();
     }
-    let mut yielding_to_update = false;
+    let mut hidden_reason = resolution.err().unwrap_or("reason=host_window_unavailable");
     let placement = target.and_then(|(host, pid)| {
+        hidden_reason = "reason=host_window_settling";
         if !layout
             .motion
             .accepts(host, NSEvent::pressedMouseButtons() & 1 != 0, now)
@@ -378,14 +427,18 @@ fn sync(app: &AppHandle) {
             x: (host.frame.x + RAIL_CENTER_X) as f32,
             y: (primary_top? - host.frame.y - BADGE_CENTER_FROM_BOTTOM) as f32,
         }) {
-            yielding_to_update = true;
+            hidden_reason = "reason=app_update_priority";
             return None;
         }
+        hidden_reason = "reason=rail_offscreen";
         let screen = screens
             .iter()
             .map(|screen| Rect::from(screen.visibleFrame()))
             .find(|screen| screen.contains(collapsed_frame(host.frame)))?;
         if layout.target_id != Some(host.id) {
+            crate::log_lifecycle(app, "sidebar_target_changed", &format!(
+                "window_id={} previous_id={:?} frame={:?}", host.id, layout.target_id, host.frame,
+            ));
             if layout.expanded {
                 let _ = app.emit_to("widget", "widget-collapsed", ());
             }
@@ -442,6 +495,7 @@ fn sync(app: &AppHandle) {
             );
         }
         layout.visible = true;
+        layout.hidden_reason = None;
         layout.target_id = Some(id);
     } else {
         if native.isVisible() {
@@ -452,19 +506,22 @@ fn sync(app: &AppHandle) {
         }
         if layout.visible || layout.expanded {
             let _ = app.emit_to("widget", "widget-collapsed", ());
-            crate::log_lifecycle(app, "sidebar_hidden", if yielding_to_update {
-                "reason=app_update_priority"
-            } else {
-                "reason=target_inactive_or_settling"
-            });
+        }
+        if layout.hidden_reason != Some(hidden_reason) {
+            let foreground = NSWorkspace::sharedWorkspace().frontmostApplication();
+            let bundle = foreground.as_ref().and_then(|app| app.bundleIdentifier())
+                .map(|bundle| bundle.to_string()).unwrap_or_else(|| "unknown".into());
+            crate::log_lifecycle(app, "sidebar_hidden", &format!(
+                "{hidden_reason} foreground_bundle={bundle} foreground_pid={:?} candidate={:?} accepted={:?} retained_id={:?}",
+                foreground.map(|app| app.processIdentifier()),
+                layout.motion.candidate,
+                layout.motion.accepted,
+                layout.target_id,
+            ));
         }
         // Retain motion history while hidden, otherwise every tick would restart
         // settling and the badge would never return after a Space transition.
-        layout.expanded = false;
-        layout.visible = false;
-        // Keep probing the same host if hiding an expanded companion leaves
-        // our accessory app in the foreground. Unrelated apps still clear it.
-        layout.target_id = if yielding_to_update { target.map(|(host, _)| host.id) } else { None };
+        layout.hide(target.map(|(host, _)| host), hidden_reason);
     }
 }
 
@@ -833,7 +890,7 @@ mod tests {
         let mut motion = MotionGate::default();
         motion.accepts(host, false, now);
         assert!(motion.accepts(host, false, now + SETTLE_TIME));
-        let another = HostWindow { id: 2, ..host };
+        let another = HostWindow { id: 2, frame: Rect { x: 320.0, ..HOST } };
         assert!(!motion.accepts(another, true, now + Duration::from_millis(400)));
         motion.clear_target();
         assert!(!motion.accepts(host, false, now + Duration::from_millis(500)));
@@ -854,5 +911,123 @@ mod tests {
     fn unrelated_apps_and_widget_without_a_host_do_not_attach() {
         assert_eq!(target_scope(false, false, 300, Some(7)), None);
         assert_eq!(target_scope(false, true, 200, None), None);
+    }
+
+    #[test]
+    fn repeated_chat_switches_at_the_same_rail_do_not_hide_for_motion_or_update_probes() {
+        let now = Instant::now();
+        let mut motion = MotionGate::default();
+        let updates = UpdatePriority::default();
+        let initial = HostWindow { id: 1, frame: HOST };
+        assert!(!motion.accepts(initial, false, now));
+        assert!(motion.accepts(initial, false, now + SETTLE_TIME));
+        for index in 0..100 {
+            let host = HostWindow {
+                id: index + 2,
+                frame: Rect {
+                    width: HOST.width + f64::from(index % 2) * 40.0,
+                    height: HOST.height + f64::from(index % 3) * 10.0,
+                    ..HOST
+                },
+            };
+            assert!(motion.accepts(host, false, now + SETTLE_TIME + Duration::from_millis(u64::from(index) * 80)));
+            let target = UpdateTarget {
+                pid: 100,
+                window_id: host.id,
+                x: (host.frame.x + RAIL_CENTER_X) as f32,
+                y: (SCREEN.height - host.frame.y - BADGE_CENTER_FROM_BOTTOM) as f32,
+            };
+            assert!(!updates.should_yield(target));
+            updates.record(target, update_priority::Observation::Unavailable);
+            assert!(!updates.should_yield(target));
+        }
+    }
+
+    #[test]
+    fn settling_retains_the_host_for_widget_activation_but_other_apps_clear_it() {
+        let host = HostWindow { id: 7, frame: HOST };
+        let mut layout = Layout { visible: true, target_id: Some(host.id), ..Layout::default() };
+        layout.hide(Some(host), "reason=host_window_settling");
+        let scope = target_scope(false, true, 200, layout.target_id).unwrap();
+        assert!(scope.matches(Some(100), Some(host.id.into())));
+        assert!(!layout.visible);
+        assert_eq!(target_scope(false, false, 300, layout.target_id), None);
+        layout.hide(None, "reason=foreground_app_inactive");
+        assert_eq!(layout.target_id, None);
+        assert_eq!(target_scope(false, true, 200, layout.target_id), None);
+    }
+
+    #[test]
+    fn project_popovers_do_not_hide_the_main_window_or_move_its_badge() {
+        let main = HostWindow { id: 7, frame: HOST };
+        let popover = HostWindow {
+            id: 8,
+            frame: Rect { x: 400.0, y: 200.0, width: 340.0, height: 160.0 },
+        };
+        let selected = select_host_window([(popover, 100), (main, 100)]).unwrap();
+        assert_eq!(selected, (main, 100));
+        assert_eq!(
+            dock_frame(selected.0.frame, SCREEN, false),
+            dock_frame(main.frame, SCREEN, false),
+        );
+    }
+
+    #[test]
+    fn transient_windows_preserve_front_to_back_main_window_selection() {
+        let background = HostWindow { id: 7, frame: HOST };
+        let foreground = HostWindow {
+            id: 9,
+            frame: Rect { x: 300.0, ..HOST },
+        };
+        let short_panel = HostWindow {
+            id: 10,
+            frame: Rect { width: 600.0, height: 200.0, ..HOST },
+        };
+        let narrow_panel = HostWindow {
+            id: 11,
+            frame: Rect { width: 200.0, height: 600.0, ..HOST },
+        };
+        assert_eq!(
+            select_host_window([
+                (short_panel, 100),
+                (narrow_panel, 100),
+                (foreground, 100),
+                (background, 100),
+            ]),
+            Some((foreground, 100)),
+        );
+        assert_eq!(
+            select_host_window([(short_panel, 100), (narrow_panel, 100)]),
+            None,
+        );
+        assert_eq!(select_host_window([]), None);
+    }
+
+    #[test]
+    fn a_large_browser_surface_inside_codex_does_not_receive_the_badge() {
+        let main = HostWindow { id: 7, frame: HOST };
+        let browser = HostWindow {
+            id: 8,
+            frame: Rect { x: 400.0, y: 200.0, width: 600.0, height: 400.0 },
+        };
+        let chosen = select_host_window([(browser, 100), (main, 100)]).unwrap();
+        assert_eq!(chosen, (main, 100));
+        assert_eq!(dock_frame(chosen.0.frame, SCREEN, false), dock_frame(HOST, SCREEN, false));
+    }
+
+    #[test]
+    fn nested_browser_surfaces_do_not_override_their_outer_main_window() {
+        let main = HostWindow { id: 7, frame: HOST };
+        let browser = HostWindow {
+            id: 8,
+            frame: Rect { x: 200.0, y: 100.0, width: 800.0, height: 600.0 },
+        };
+        let inner = HostWindow {
+            id: 9,
+            frame: Rect { x: 300.0, y: 200.0, width: 500.0, height: 400.0 },
+        };
+        assert_eq!(select_host_window([(inner, 100), (browser, 100), (main, 100)]), Some((main, 100)));
+        let replacement = HostWindow { id: 10, ..main };
+        assert_eq!(select_host_window([(replacement, 100), (main, 100)]), Some((replacement, 100)));
     }
 }

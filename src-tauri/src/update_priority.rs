@@ -9,7 +9,6 @@ use std::{
 };
 
 const RESTORE_DELAY: Duration = Duration::from_millis(350);
-const INITIAL_PROBE_GRACE: Duration = Duration::from_millis(350);
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -59,7 +58,6 @@ struct Cache {
     target: Option<UpdateTarget>,
     observation: Option<Observation>,
     confirmed: Option<Observation>,
-    requested_at: Option<Instant>,
     clear_since: Option<Instant>,
 }
 
@@ -68,20 +66,17 @@ impl Cache {
         if self.target != Some(target) {
             *self = Self {
                 target: Some(target),
-                requested_at: Some(now),
                 ..Self::default()
             };
         }
         match self.confirmed {
             Some(Observation::Visible) => true,
-            Some(Observation::Clear) => !self
+            Some(Observation::Clear) => self
                 .clear_since
-                .is_some_and(|since| now.duration_since(since) >= RESTORE_DELAY),
-            // Missing permission or a transient AX error must never make an
-            // otherwise normal quota badge disappear indefinitely.
-            _ => self
-                .requested_at
-                .is_some_and(|since| now.duration_since(since) < INITIAL_PROBE_GRACE),
+                .is_some_and(|since| now.duration_since(since) < RESTORE_DELAY),
+            // A fresh or unavailable probe is not evidence of an update.
+            // Keep the badge visible until a control is actually detected.
+            _ => false,
         }
     }
 
@@ -92,7 +87,7 @@ impl Cache {
         }
         let changed = self.observation != Some(observation);
         if observation == Observation::Clear {
-            if self.confirmed != Some(Observation::Clear) {
+            if self.confirmed == Some(Observation::Visible) {
                 self.clear_since = Some(now);
             }
             self.confirmed = Some(Observation::Clear);
@@ -248,7 +243,7 @@ mod tests {
     fn update_presence_hides_immediately_and_absence_must_settle() {
         let now = Instant::now();
         let mut cache = Cache::default();
-        assert!(cache.should_yield(TARGET, now));
+        assert!(!cache.should_yield(TARGET, now));
         cache.record(TARGET, Observation::Visible, now);
         assert!(cache.should_yield(TARGET, now));
         cache.record(TARGET, Observation::Clear, now);
@@ -259,12 +254,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_detection_never_hides_normal_quota_indefinitely() {
+    fn unknown_detection_never_hides_normal_quota_even_during_the_first_probe() {
         let now = Instant::now();
         let mut cache = Cache::default();
-        cache.should_yield(TARGET, now);
+        assert!(!cache.should_yield(TARGET, now));
         cache.record(TARGET, Observation::Unavailable, now);
-        assert!(!cache.should_yield(TARGET, now + INITIAL_PROBE_GRACE));
+        assert!(!cache.should_yield(TARGET, now));
         cache.record(TARGET, Observation::Clear, now);
         assert!(!cache.should_yield(TARGET, now + RESTORE_DELAY));
         cache.record(
@@ -289,16 +284,32 @@ mod tests {
         let now = Instant::now();
         let mut cache = Cache::default();
         cache.should_yield(TARGET, now);
-        cache.record(TARGET, Observation::Clear, now);
+        cache.record(TARGET, Observation::Visible, now);
+        assert!(cache.should_yield(TARGET, now));
         let next = UpdateTarget {
             window_id: 8,
             ..TARGET
         };
-        assert!(cache.should_yield(next, now + RESTORE_DELAY));
-        assert!(!cache.record(TARGET, Observation::Clear, now + RESTORE_DELAY));
-        assert!(cache.should_yield(next, now + RESTORE_DELAY));
+        assert!(!cache.should_yield(next, now + RESTORE_DELAY));
+        assert!(!cache.record(TARGET, Observation::Visible, now + RESTORE_DELAY));
+        assert!(!cache.should_yield(next, now + RESTORE_DELAY));
         cache = Cache::default();
         assert!(!cache.record(next, Observation::Clear, now + RESTORE_DELAY));
+    }
+
+    #[test]
+    fn an_initial_clear_probe_does_not_start_an_update_restore_delay() {
+        let now = Instant::now();
+        let mut cache = Cache::default();
+        assert!(!cache.should_yield(TARGET, now));
+        cache.record(TARGET, Observation::Clear, now);
+        assert!(!cache.should_yield(TARGET, now));
+        cache.record(TARGET, Observation::Visible, now + Duration::from_secs(1));
+        assert!(cache.should_yield(TARGET, now + Duration::from_secs(1)));
+        cache.record(TARGET, Observation::Clear, now + Duration::from_secs(2));
+        assert!(cache.should_yield(TARGET, now + Duration::from_secs(2)));
+        cache.record(TARGET, Observation::Clear, now + Duration::from_millis(2200));
+        assert!(!cache.should_yield(TARGET, now + Duration::from_secs(2) + RESTORE_DELAY));
     }
 
     #[test]

@@ -1,13 +1,12 @@
-## Glint 0.2.2 — minimal macOS companion
+## Glint 0.2.3 — stable attachment when switching chats
 
-- New warm-white and soft-blue icon with a small luminous glint.
-- No Dock icon, menu-bar item, settings page, or old card UI.
-- Open once after installing in Applications; follows Codex launch and exit.
-- Preserves the continuous halo, serif digits, hour/minute countdown, and confirmed reset action.
-- Community modification of Quota Float under MIT; not an official OpenAI product.
+- Keep the quota badge visible when switching chats without moving the Codex navigation rail.
+- Keep the badge attached to the main Codex window when an embedded browser or tool window appears.
+- Preserve the host window while the badge is temporarily hidden, so it can return reliably.
+- Yield to the app update control only after it is actually detected; an unavailable probe no longer hides the badge.
 
 Apple Silicon · macOS 15.2+
 
-**Test package: ad-hoc signed, not notarized. Gatekeeper may block first launch on another Mac.**
+**Ad-hoc signed, not notarized. Gatekeeper may block first launch on another Mac.** See README for installation and watcher removal.
 
-See README for installation and watcher removal. Verify the SHA-256 file before sharing. Real account credentials are never bundled.
+Download `glint-0.2.3-macos-arm64-adhoc.zip` for the app. The source ZIP and SHA-256 files are included separately.
