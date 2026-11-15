@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "halo-events",
+  "description": "Presentation events for the non-interactive quota halo",
+  "windows": ["halo"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "core:event:allow-emit-to"]
+}

@@ -1,0 +1,180 @@
+.quota-widget {
+  --panel-size: 288px;
+  --detail-scale: .847058824;
+  --badge-size: 84px;
+  --badge-inset: 8px;
+  --cloud-scale: .291666667;
+  --cloud-offset: 94px;
+  --cloud-x: calc(-1 * var(--cloud-offset));
+  --cloud-y: calc(-1 * var(--cloud-offset));
+  --widget-ink: light-dark(#596368, #d4dde2);
+  --widget-muted: light-dark(#6b777f, #b4bfc7);
+  --widget-tertiary: light-dark(#53616a, #bcc8d1);
+  --widget-paper: light-dark(#fdfefe, #232a31);
+  --quota-a: light-dark(#b9d9fb, #3f6b9b);
+  --quota-bridge: light-dark(#dfedfd, #314a65);
+  --quota-b: light-dark(#f4f8ff, #28313c);
+  --coverage-core: var(--quota-a);
+  width: 100%;
+  height: 100%;
+  position: relative;
+  isolation: isolate;
+  /* Clip the input window without creating a scroll container. Off-window
+     halo paint must not scroll the metrics when a reset button takes focus. */
+  overflow: clip;
+  color-scheme: light dark;
+  color: var(--widget-ink);
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+  pointer-events: none;
+}
+.quota-widget.is-docked { --badge-size: 52px; --badge-inset: 0px; --cloud-scale: .180555556; --cloud-offset: 118px; }
+.quota-widget--top-right, .quota-widget--bottom-right { --cloud-x: var(--cloud-offset); }
+.quota-widget--bottom-left, .quota-widget--bottom-right { --cloud-y: var(--cloud-offset); }
+.quota-widget-panel { position: absolute; top: 0; left: 0; width: var(--panel-size); height: var(--panel-size); pointer-events: none; }
+.quota-widget--top-right .quota-widget-panel, .quota-widget--bottom-right .quota-widget-panel { left: auto; right: 0; }
+.quota-widget--bottom-left .quota-widget-panel, .quota-widget--bottom-right .quota-widget-panel { top: auto; bottom: 0; }
+.quota-widget-cloud {
+  position: absolute;
+  inset: 0;
+  isolation: isolate;
+  transform: translate3d(var(--cloud-x), var(--cloud-y), 0) scale(var(--cloud-scale));
+  transform-origin: center;
+  transition: transform 300ms cubic-bezier(.2, .88, .24, 1);
+}
+/* A web backdrop filter cannot blur another native window. Concentrate the
+   paper behind the data, then let it disperse across the companion canvas.
+   There is no opaque disc or clipping mask underneath the colored plume. */
+.quota-widget-backdrop {
+  position: absolute;
+  left: 50%;
+  top: 55.5%;
+  width: 164%;
+  height: 142%;
+  transform: translate(-50%, -50%);
+  z-index: -1;
+  background: radial-gradient(ellipse closest-side in oklab,
+    var(--widget-paper) 0%,
+    color-mix(in oklab, var(--widget-paper) 99.9%, transparent) 28%,
+    color-mix(in oklab, var(--widget-paper) 99.5%, transparent) 40%,
+    color-mix(in oklab, var(--widget-paper) 96%, transparent) 50%,
+    color-mix(in oklab, var(--widget-paper) 60%, transparent) 64%,
+    color-mix(in oklab, var(--widget-paper) 29%, transparent) 76%,
+    color-mix(in oklab, var(--widget-paper) 7%, transparent) 88%,
+    color-mix(in oklab, var(--widget-paper) .8%, transparent) 96%,
+    transparent 100%);
+  filter: blur(10px);
+  opacity: 0;
+  transition: opacity 70ms ease-out;
+  pointer-events: none;
+}
+.quota-widget.is-expanded .quota-widget-backdrop { opacity: 1; }
+.quota-widget.is-expanded {
+  --widget-ink: light-dark(#45535c, #edf2f5);
+  --widget-muted: light-dark(#52616b, #c2cdd5);
+}
+.quota-widget-cloud::before {
+  content: "";
+  position: absolute;
+  left: 53%;
+  top: 62%;
+  width: 152%;
+  height: 120%;
+  transform: translate(-50%, -50%);
+  /* Continuous falloff, with no solid center or abrupt shoulder. Keep the
+     same hue through transparency so the tail blends into the host surface. */
+  background: radial-gradient(ellipse closest-side in oklab,
+    color-mix(in oklab, var(--coverage-core) 66%, transparent) 0%,
+    color-mix(in oklab, var(--coverage-core) 63%, transparent) 14%,
+    color-mix(in oklab, var(--coverage-core) 50%, transparent) 30%,
+    color-mix(in oklab, var(--coverage-core) 31%, transparent) 46%,
+    color-mix(in oklab, var(--coverage-core) 15%, transparent) 62%,
+    color-mix(in oklab, var(--coverage-core) 4%, transparent) 78%,
+    color-mix(in oklab, var(--coverage-core) .5%, transparent) 92%,
+    transparent 100%);
+  background-size: 100% 100%;
+  mask-image: none;
+  filter: blur(8px);
+  opacity: 1;
+  pointer-events: none;
+}
+.quota-widget:not(.is-expanded) .quota-widget-cloud::before {
+  /* An 88 × 84 pt field at the docked scale leaves room for a soft, faint
+     tail. The 52 pt input target stays independent of the painted halo. */
+  left: 50%;
+  top: 54%;
+  width: 169.230769%;
+  height: 161.538462%;
+  filter: blur(7px);
+}
+.quota-widget.has-native-halo .quota-widget-cloud { visibility: hidden; }
+.quota-halo-surface { position: relative; width: 100%; height: 100%; overflow: hidden; container-type: inline-size; pointer-events: none; }
+.quota-halo-core { position: absolute; left: 40px; bottom: 40px; width: 52px; height: 52px; overflow: visible; }
+.quota-halo-core.is-expanded { width: var(--panel-size); height: var(--panel-size); }
+@container (min-width: 400px) {
+  .quota-halo-core { left: 110px; bottom: 110px; }
+}
+.quota-widget.is-expanded .quota-widget-cloud {
+  transform: translate3d(0, 0, 0) scale(1);
+  transition-duration: 420ms;
+}
+.quota-widget-badge, .quota-widget-activate { position: absolute; top: var(--badge-inset); left: var(--badge-inset); width: var(--badge-size); height: var(--badge-size); }
+.quota-widget--top-right .quota-widget-badge, .quota-widget--bottom-right .quota-widget-badge,
+.quota-widget--top-right .quota-widget-activate, .quota-widget--bottom-right .quota-widget-activate { left: auto; right: var(--badge-inset); }
+.quota-widget--bottom-left .quota-widget-badge, .quota-widget--bottom-right .quota-widget-badge,
+.quota-widget--bottom-left .quota-widget-activate, .quota-widget--bottom-right .quota-widget-activate { top: auto; bottom: var(--badge-inset); }
+.quota-widget-badge { display: grid; place-items: center; opacity: 1; transition: opacity 100ms ease-out; pointer-events: auto; }
+.quota-widget.is-docked .quota-widget-badge, .quota-widget.is-expanded .quota-widget-badge { pointer-events: none; }
+.quota-widget-badge svg { width: 20px; height: 20px; color: var(--widget-muted); }
+.quota-widget.is-expanded .quota-widget-badge { opacity: 0; }
+.quota-widget-activate { z-index: 2; padding: 0; border: 0; border-radius: 14px; background: transparent; pointer-events: auto; cursor: pointer; }
+.quota-widget-activate:focus-visible { outline: 1px solid #668eb4; outline-offset: -1px; }
+.badge-number, .widget-number, .widget-credits > span { font-family: "Quota Instrument Serif", Georgia, serif; font-style: normal; font-weight: 400; line-height: 1; font-variant-numeric: lining-nums tabular-nums; }
+.badge-number, .widget-number { text-box-trim: trim-both; text-box-edge: cap alphabetic; }
+.badge-number { font-family: "Quota Manrope", system-ui, sans-serif; font-size: 23px; letter-spacing: 0; }
+.quota-widget.is-docked .badge-number { font-size: 14px; }
+.quota-widget-details { position: absolute; inset: 0; display: grid; place-items: center; opacity: 0; pointer-events: none; transition: opacity 100ms ease-out; }
+.quota-widget.is-expanded .quota-widget-details { opacity: 1; pointer-events: auto; cursor: move; transition-duration: 200ms; transition-delay: 70ms; }
+.quota-widget.is-docked .quota-widget-details { cursor: default; }
+/* Scale the complete group together, preserving the typography and spacing ratios. */
+.widget-data-group, .widget-error { transform: scale(var(--detail-scale)); }
+/* Center the visual weight of the large numerals, rather than the group's
+   bounding box. Translate after scaling so the optical offset stays 12 pt. */
+.widget-data-group { transform: translateY(12px) scale(var(--detail-scale)); display: flex; flex-direction: column; align-items: center; gap: 25.5px; }
+.widget-data-columns { width: 217.6px; display: flex; justify-content: center; gap: 30.6px; }
+.widget-metric { min-width: 0; flex: 1 1 0; display: flex; flex-direction: column; align-items: center; gap: 15.3px; text-align: center; }
+.widget-number { font-size: 54px; letter-spacing: -.01em; }
+.widget-time { color: var(--widget-muted); font-size: 14px; font-weight: 400; line-height: 1.3; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.widget-credits { display: flex; align-items: baseline; justify-content: center; gap: 4px; margin: 0; color: var(--widget-tertiary); font-size: 13px; font-weight: 400; line-height: 1.2; }
+.widget-credits > span { font-family: "Quota Manrope", system-ui, sans-serif; font-size: 13px; }
+.widget-credits small { font-size: inherit; }
+.widget-data-group.is-single .widget-number { font-size: 63.75px; }
+.widget-error { display: flex; align-items: center; gap: 9px; color: var(--widget-muted); font-size: 13px; }
+.widget-error svg { width: 20px; height: 20px; }
+.widget-notice { position: absolute; bottom: 26px; left: 26px; right: 26px; margin: 0; text-align: center; color: var(--widget-muted); font-size: 11px; }
+.widget-loading { width: 100%; height: 100%; display: grid; place-items: center; background: transparent; }
+.widget-loading span { width: 12px; height: 12px; border: 2px solid #a7c4df; border-top-color: #477bad; border-radius: 50%; animation: loading-spin 1s linear infinite; }
+@keyframes loading-spin { to { transform: rotate(360deg); } }
+@media (prefers-color-scheme: dark) {
+  .quota-widget { --coverage-core: color-mix(in oklab, var(--quota-a) 80%, var(--widget-paper)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .quota-widget-cloud::before, .widget-loading span { animation: none; }
+  .quota-widget-cloud, .quota-widget-backdrop, .quota-widget-badge, .quota-widget-details { transition-duration: .01ms !important; transition-delay: 0ms !important; }
+}
+
+.widget-reset { position: relative; display: flex; flex-direction: column; align-items: center; }
+button.widget-credits { padding: 8px 12px; margin: -8px 0; border: 0; border-radius: 14px; background: transparent; cursor: pointer; }
+button.widget-credits:hover:not(:disabled) { background: light-dark(#ffffff60, #ffffff10); color: var(--widget-ink); }
+button.widget-credits:disabled { cursor: default; }
+.widget-reset button:focus-visible { outline: 1px solid var(--widget-muted); outline-offset: 2px; }
+.widget-reset.is-confirming > .widget-credits { visibility: hidden; }
+.reset-confirm { position: absolute; top: -1px; width: 180px; text-align: center; }
+.reset-confirm p { margin: 0; color: var(--widget-muted); font-size: 13px; font-weight: 400; line-height: 1.4; }
+.reset-actions { display: flex; justify-content: center; gap: 12px; margin-top: 6px; }
+.reset-actions button { min-width: 48px; min-height: 30px; border: 0; border-radius: 5px; padding: 6px 8px; color: var(--widget-muted); background: transparent; cursor: pointer; font-size: 13px; font-weight: 400; white-space: nowrap; }
+.reset-actions button:last-child { color: var(--widget-ink); }
+.reset-actions button:hover:not(:disabled) { text-decoration: underline; text-underline-offset: 3px; }
+.reset-actions button:disabled { opacity: .6; cursor: wait; }
+.reset-status { position: absolute; top: 25px; width: 240px; margin: 0; text-align: center; font-size: 13px; line-height: 1.5; color: var(--widget-muted); }
+.reset-confirm + .reset-status { top: 58px; }

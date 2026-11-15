@@ -1,0 +1,858 @@
+//! A companion window aligned to the Codex rail. This never changes Codex files
+//! or reads chat content. Window bounds come from WindowServer, in points;
+//! update-control presence comes from narrow, read-only accessibility queries.
+
+use crate::update_priority::{self, UpdatePriority, UpdateTarget};
+
+use block2::RcBlock;
+use objc2::{rc::Retained, runtime::ProtocolObject, MainThreadMarker};
+use objc2_app_kit::{
+    NSEvent, NSFloatingWindowLevel, NSScreen, NSWindow,
+    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWorkspace, NSWorkspaceActiveSpaceDidChangeNotification, NSRunningApplication,
+    NSWorkspaceDidActivateApplicationNotification, NSWorkspaceDidDeactivateApplicationNotification,
+};
+use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CFType, CGRect};
+use objc2_core_graphics::{
+    kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
+    CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo, CGWindowListOption,
+};
+use objc2_foundation::{NSNotification, NSObjectProtocol, NSPoint, NSRect, NSSize};
+use std::{
+    cell::RefCell,
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    time::{Duration, Instant},
+};
+use tauri::{AppHandle, Emitter, Listener, Manager};
+
+pub const COLLAPSED_SIDE: f64 = 52.0;
+const EXPANDED_SIDE: f64 = 288.0;
+const COLLAPSED_HALO_PADDING: f64 = 40.0;
+const EXPANDED_HALO_PADDING: f64 = 110.0;
+// Keep the soft halo's transparent 52 pt click target on the shared center
+// and 44 pt vertical rhythm of the official controls.
+const RAIL_CENTER_X: f64 = 26.0;
+const BADGE_CENTER_FROM_BOTTOM: f64 = 114.0;
+const SETTLE_TIME: Duration = Duration::from_millis(350);
+
+thread_local! {
+    // Keep the observer on the main thread, like the AppKit notification center.
+    static WORKSPACE_OBSERVERS: RefCell<Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Rect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl Rect {
+    fn contains(self, other: Self) -> bool {
+        other.x >= self.x
+            && other.y >= self.y
+            && other.x + other.width <= self.x + self.width
+            && other.y + other.height <= self.y + self.height
+    }
+
+    fn native(self) -> NSRect {
+        NSRect::new(
+            NSPoint::new(self.x, self.y),
+            NSSize::new(self.width, self.height),
+        )
+    }
+}
+
+impl From<NSRect> for Rect {
+    fn from(value: NSRect) -> Self {
+        Self {
+            x: value.origin.x,
+            y: value.origin.y,
+            width: value.size.width,
+            height: value.size.height,
+        }
+    }
+}
+
+fn from_window_server(bounds: CGRect, primary_screen_top: f64) -> Rect {
+    // CG uses the primary display's top-left origin; AppKit uses bottom-left.
+    // Do not use the current display's height: secondary displays can be offset.
+    Rect {
+        x: bounds.origin.x,
+        y: primary_screen_top - bounds.origin.y - bounds.size.height,
+        width: bounds.size.width,
+        height: bounds.size.height,
+    }
+}
+
+fn collapsed_frame(host: Rect) -> Rect {
+    Rect {
+        x: host.x + RAIL_CENTER_X - COLLAPSED_SIDE / 2.0,
+        y: host.y + BADGE_CENTER_FROM_BOTTOM - COLLAPSED_SIDE / 2.0,
+        width: COLLAPSED_SIDE,
+        height: COLLAPSED_SIDE,
+    }
+}
+
+fn halo_frame(core: Rect, expanded: bool) -> Rect {
+    let padding = if expanded { EXPANDED_HALO_PADDING } else { COLLAPSED_HALO_PADDING };
+    Rect {
+        x: core.x - padding,
+        y: core.y - padding,
+        width: core.width + 2.0 * padding,
+        height: core.height + 2.0 * padding,
+    }
+}
+
+pub fn create_halo(app: &AppHandle) -> tauri::Result<()> {
+    let halo = tauri::WebviewWindowBuilder::new(app, "halo", tauri::WebviewUrl::App("index.html".into()))
+        .title("Glint Halo")
+        .inner_size(132.0, 132.0)
+        .max_inner_size(640.0, 640.0)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .resizable(false)
+        .always_on_top(true)
+        .focusable(false)
+        .focused(false)
+        .skip_taskbar(true)
+        .visible(false)
+        .build()?;
+    halo.set_ignore_cursor_events(true)?;
+    if let Some(widget) = app.get_webview_window("widget") {
+        let handle = app.clone();
+        widget.listen("quota-halo-ready", move |_| {
+            crate::log_lifecycle(&handle, "halo_renderer_ready", "presentation_events=connected");
+        });
+    }
+    crate::log_lifecycle(app, "halo_created", "mouse_events=ignored collapsed_canvas=132 expanded_canvas=508");
+    Ok(())
+}
+
+fn dock_frame(host: Rect, screen: Rect, expanded: bool) -> Option<Rect> {
+    let badge = collapsed_frame(host);
+    // Hide when the rail itself is offscreen instead of placing the badge over
+    // unrelated content. Keep the expanded card inside the same display.
+    if !screen.contains(badge) {
+        return None;
+    }
+    if !expanded {
+        return Some(badge);
+    }
+    if screen.width < EXPANDED_SIDE || screen.height < EXPANDED_SIDE {
+        return None;
+    }
+    Some(Rect {
+        x: badge
+            .x
+            .clamp(screen.x, screen.x + screen.width - EXPANDED_SIDE),
+        y: badge
+            .y
+            .clamp(screen.y, screen.y + screen.height - EXPANDED_SIDE),
+        width: EXPANDED_SIDE,
+        height: EXPANDED_SIDE,
+    })
+}
+
+#[derive(Default)]
+struct Layout {
+    expanded: bool,
+    visible: bool,
+    target_id: Option<u32>,
+    motion: MotionGate,
+}
+
+#[derive(Default)]
+pub struct SidebarState {
+    layout: Mutex<Layout>,
+    queued: AtomicBool,
+    stopped: AtomicBool,
+    space_changed: AtomicBool,
+    tracking: AtomicBool,
+    worker: Mutex<Option<std::thread::Thread>>,
+    updates: UpdatePriority,
+}
+
+#[derive(Default)]
+struct MotionGate {
+    candidate: Option<HostWindow>,
+    stable_since: Option<Instant>,
+    accepted: Option<HostWindow>,
+    blocked_until: Option<Instant>,
+}
+
+impl MotionGate {
+    fn clear_target(&mut self) {
+        self.candidate = None;
+        self.stable_since = None;
+        self.accepted = None;
+    }
+
+    fn space_changed(&mut self, now: Instant) {
+        self.clear_target();
+        self.blocked_until = Some(now + SETTLE_TIME);
+    }
+
+    fn accepts(&mut self, host: HostWindow, mouse_down: bool, now: Instant) -> bool {
+        let dragging_host = mouse_down && self.accepted.is_some_and(|last| last.id == host.id);
+        if self.candidate != Some(host) {
+            self.candidate = Some(host);
+            self.stable_since = Some(now);
+        }
+        if self.blocked_until.is_some_and(|deadline| now < deadline) {
+            return false;
+        }
+        // WindowServer can report intermediate, horizontally translated bounds
+        // during a Spaces swipe. Only a real mouse drag may track those changes
+        // live; other movement must settle before we position or show the badge.
+        if dragging_host
+            || self
+                .stable_since
+                .is_some_and(|since| now.duration_since(since) >= SETTLE_TIME)
+        {
+            self.accepted = Some(host);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn number(dict: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<i64> {
+    dict.get(key)?.downcast::<CFNumber>().ok()?.as_i64()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HostWindow {
+    id: u32,
+    frame: Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TargetScope {
+    Process(i64),
+    RetainedWindow(u32),
+}
+
+fn target_scope(
+    is_codex: bool,
+    is_widget: bool,
+    foreground_pid: i64,
+    retained_id: Option<u32>,
+) -> Option<TargetScope> {
+    if is_codex {
+        Some(TargetScope::Process(foreground_pid))
+    } else if is_widget {
+        // Clicking the companion can activate its accessory application even
+        // when the window can't become key. Keep the same Codex host in that
+        // case; only unrelated apps should dismiss the companion.
+        retained_id.map(TargetScope::RetainedWindow)
+    } else {
+        None
+    }
+}
+
+impl TargetScope {
+    fn matches(self, owner_pid: Option<i64>, window_id: Option<i64>) -> bool {
+        match self {
+            Self::Process(pid) => owner_pid == Some(pid),
+            Self::RetainedWindow(id) => window_id == Some(i64::from(id)),
+        }
+    }
+}
+
+fn target_window(primary_screen_top: f64, retained_id: Option<u32>) -> Option<(HostWindow, i32)> {
+    let foreground = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    let pid = foreground.processIdentifier() as i64;
+    let scope = target_scope(
+        foreground
+            .bundleIdentifier()
+            .is_some_and(|id| id.to_string() == "com.openai.codex"),
+        pid == i64::from(std::process::id()),
+        pid,
+        retained_id,
+    )?;
+    let windows = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        0,
+    )?;
+    // WindowServer guarantees CFDictionary elements with CFType values.
+    let windows =
+        unsafe { CFRetained::cast_unchecked::<objc2_core_foundation::CFArray<CFType>>(windows) };
+    for entry in &*windows {
+        let Some(dict) = entry.downcast_ref::<CFDictionary>() else {
+            continue;
+        };
+        // Window info dictionaries have CFString keys and CFType values.
+        let dict = unsafe { dict.cast_unchecked::<CFString, CFType>() };
+        // These constant keys belong to CoreGraphics and are immutable.
+        let (owner, layer, id, bounds) = unsafe {
+            (
+                number(dict, kCGWindowOwnerPID),
+                number(dict, kCGWindowLayer),
+                number(dict, kCGWindowNumber),
+                dict.get(kCGWindowBounds),
+            )
+        };
+        if !scope.matches(owner, id) || layer != Some(0) {
+            continue;
+        }
+        let owner_pid = i32::try_from(owner?).ok()?;
+        if !NSRunningApplication::runningApplicationWithProcessIdentifier(owner_pid)
+            .and_then(|application| application.bundleIdentifier())
+            .is_some_and(|bundle| bundle.to_string() == "com.openai.codex")
+        {
+            continue;
+        }
+        let bounds = bounds?.downcast::<CFDictionary>().ok()?;
+        let mut rect = CGRect::ZERO;
+        if !unsafe { CGRectMakeWithDictionaryRepresentation(Some(&bounds), &mut rect) } {
+            return None;
+        }
+        // The list is front-to-back. A small foremost window is a dialog or
+        // utility, so don't attach to a main window hidden behind that dialog.
+        if rect.size.width < 480.0 || rect.size.height < 360.0 {
+            return None;
+        }
+        return Some((HostWindow {
+            id: u32::try_from(id?).ok()?,
+            frame: from_window_server(rect, primary_screen_top),
+        }, owner_pid));
+    }
+    None
+}
+
+/// Must run on the main thread. All AppKit access stays on that thread.
+fn sync(app: &AppHandle) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(window) = app.get_webview_window("widget") else {
+        return;
+    };
+    let Ok(pointer) = window.ns_window() else {
+        return;
+    };
+    // `window` keeps this native window alive throughout this main-thread call.
+    let native = unsafe { &*(pointer as *const NSWindow) };
+    let halo_window = app.get_webview_window("halo");
+    let halo_pointer = halo_window.as_ref().and_then(|window| window.ns_window().ok());
+    let halo = halo_pointer.map(|pointer| unsafe { &*(pointer as *const NSWindow) });
+    let state = app.state::<SidebarState>();
+    let Ok(mut layout) = state.layout.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    if state.space_changed.swap(false, Ordering::Relaxed) {
+        layout.motion.space_changed(now);
+        state.updates.clear();
+    }
+    let screens = NSScreen::screens(mtm);
+    let primary_top = screens.firstObject().map(|primary| {
+        let primary = primary.frame();
+        primary.origin.y + primary.size.height
+    });
+    let target = primary_top.and_then(|top| target_window(top, layout.target_id));
+    state.tracking.store(target.is_some(), Ordering::Relaxed);
+    if target.is_none() {
+        layout.motion.clear_target();
+        state.updates.clear();
+    }
+    let mut yielding_to_update = false;
+    let placement = target.and_then(|(host, pid)| {
+        if !layout
+            .motion
+            .accepts(host, NSEvent::pressedMouseButtons() & 1 != 0, now)
+        {
+            state.updates.clear();
+            return None;
+        }
+        if state.updates.should_yield(UpdateTarget {
+            pid,
+            window_id: host.id,
+            x: (host.frame.x + RAIL_CENTER_X) as f32,
+            y: (primary_top? - host.frame.y - BADGE_CENTER_FROM_BOTTOM) as f32,
+        }) {
+            yielding_to_update = true;
+            return None;
+        }
+        let screen = screens
+            .iter()
+            .map(|screen| Rect::from(screen.visibleFrame()))
+            .find(|screen| screen.contains(collapsed_frame(host.frame)))?;
+        if layout.target_id != Some(host.id) {
+            if layout.expanded {
+                let _ = app.emit_to("widget", "widget-collapsed", ());
+            }
+            layout.expanded = false;
+        }
+        dock_frame(host.frame, screen, layout.expanded).map(|frame| (host.id, frame))
+    });
+
+    if let Some((id, frame)) = placement {
+        let target = frame.native();
+        if native.frame() != target {
+            let resized = native.frame().size != target.size;
+            native.setFrame_display(target, false);
+            if resized {
+                crate::log_lifecycle(
+                    app,
+                    "widget_resized",
+                    if layout.expanded {
+                        "state=expanded side=288"
+                    } else {
+                        "state=collapsed side=52"
+                    },
+                );
+            }
+        }
+        let showing_widget = !native.isVisible();
+        if showing_widget {
+            native.orderFrontRegardless();
+        }
+        if let Some(halo) = halo {
+            let halo_target = halo_frame(frame, layout.expanded).native();
+            if halo.frame() != halo_target {
+                let resized = halo.frame().size != halo_target.size;
+                halo.setFrame_display(halo_target, false);
+                if resized {
+                    crate::log_lifecycle(app, "halo_resized", if layout.expanded {
+                        "canvas=508 core=288 mouse_events=ignored"
+                    } else {
+                        "canvas=132 core=52 mouse_events=ignored"
+                    });
+                }
+            }
+            // Both surfaces stay above Codex. The decorative surface always
+            // passes input through; the original widget remains the click target.
+            if showing_widget || !halo.isVisible() {
+                halo.orderWindow_relativeTo(NSWindowOrderingMode::Below, native.windowNumber());
+            }
+        }
+        if !layout.visible {
+            crate::log_lifecycle(
+                app,
+                "sidebar_attached",
+                "side=52 shape=soft-halo anchor=bottom-left",
+            );
+        }
+        layout.visible = true;
+        layout.target_id = Some(id);
+    } else {
+        if native.isVisible() {
+            native.orderOut(None);
+        }
+        if let Some(halo) = halo {
+            if halo.isVisible() { halo.orderOut(None); }
+        }
+        if layout.visible || layout.expanded {
+            let _ = app.emit_to("widget", "widget-collapsed", ());
+            crate::log_lifecycle(app, "sidebar_hidden", if yielding_to_update {
+                "reason=app_update_priority"
+            } else {
+                "reason=target_inactive_or_settling"
+            });
+        }
+        // Retain motion history while hidden, otherwise every tick would restart
+        // settling and the badge would never return after a Space transition.
+        layout.expanded = false;
+        layout.visible = false;
+        // Keep probing the same host if hiding an expanded companion leaves
+        // our accessory app in the foreground. Unrelated apps still clear it.
+        layout.target_id = if yielding_to_update { target.map(|(host, _)| host.id) } else { None };
+    }
+}
+
+pub fn set_expanded(app: &AppHandle, expanded: bool) -> Result<(), String> {
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        if let Ok(mut layout) = handle.state::<SidebarState>().layout.lock() {
+            layout.expanded = expanded;
+        }
+        sync(&handle);
+    })
+    .map_err(|error| format!("failed to resize sidebar badge: {error}"))
+}
+
+pub fn apply_mode(app: &AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("widget")
+        .ok_or("widget window missing")?;
+    let pointer = window.ns_window().map_err(|error| error.to_string())? as usize;
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        if let Ok(mut layout) = handle.state::<SidebarState>().layout.lock() {
+            *layout = Layout::default();
+        }
+        handle.state::<SidebarState>().updates.clear();
+        let _ = handle.emit_to("widget", "widget-collapsed", ());
+        let native = unsafe { &*(pointer as *const NSWindow) };
+        if let Some(halo_window) = handle.get_webview_window("halo") {
+            if let Ok(pointer) = halo_window.ns_window() {
+                let halo = unsafe { &*(pointer as *const NSWindow) };
+                halo.setLevel(NSFloatingWindowLevel);
+                halo.setIgnoresMouseEvents(true);
+                halo.setCollectionBehavior(
+                    NSWindowCollectionBehavior::CanJoinAllSpaces
+                        | NSWindowCollectionBehavior::Stationary
+                        | NSWindowCollectionBehavior::FullScreenAuxiliary
+                        | NSWindowCollectionBehavior::IgnoresCycle,
+                );
+                halo.orderOut(None);
+            }
+        }
+        native.setLevel(NSFloatingWindowLevel);
+        native.setHidesOnDeactivate(false);
+        native.setPreservesContentDuringLiveResize(true);
+        native.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::Stationary
+                | NSWindowCollectionBehavior::FullScreenAuxiliary
+                | NSWindowCollectionBehavior::IgnoresCycle,
+        );
+        native.orderOut(None);
+        sync(&handle);
+    })
+    .map_err(|error| format!("failed to apply sidebar mode: {error}"))
+}
+
+fn queue_sync(app: &AppHandle) {
+    let state = app.state::<SidebarState>();
+    if state.stopped.load(Ordering::Relaxed)
+        || state.queued.swap(true, Ordering::Relaxed) { return; }
+    let handle = app.clone();
+    if app.run_on_main_thread(move || {
+        sync(&handle);
+        handle.state::<SidebarState>().queued.store(false, Ordering::Relaxed);
+    }).is_err() {
+        state.queued.store(false, Ordering::Relaxed);
+    }
+}
+
+fn wake_sync(app: &AppHandle) {
+    if let Ok(worker) = app.state::<SidebarState>().worker.lock() {
+        if let Some(worker) = worker.as_ref() { worker.unpark(); }
+    }
+}
+
+pub fn start(app: &AppHandle) {
+    let notification_handle = app.clone();
+    let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+        if let Some(state) = notification_handle.try_state::<SidebarState>() {
+            state.space_changed.store(true, Ordering::Relaxed);
+        }
+        wake_sync(&notification_handle);
+    });
+    // NSWorkspace posts to its own notification center. The center copies this
+    // sendable block; it only sets a flag/wakes the worker, avoiding reentrant
+    // AppKit calls while a window is being ordered or a layout lock is held.
+    let observer = unsafe {
+        NSWorkspace::sharedWorkspace()
+            .notificationCenter()
+            .addObserverForName_object_queue_usingBlock(
+                Some(NSWorkspaceActiveSpaceDidChangeNotification),
+                None,
+                None,
+                &block,
+            )
+    };
+    WORKSPACE_OBSERVERS.with(|slot| slot.borrow_mut().push(observer));
+    // Activation notifications keep show/hide responsive even when the idle
+    // positioning timer is sleeping at its lower background frequency.
+    // These are immutable AppKit notification-name constants.
+    for name in unsafe { [NSWorkspaceDidActivateApplicationNotification, NSWorkspaceDidDeactivateApplicationNotification] } {
+        let handle = app.clone();
+        let block = RcBlock::new(move |_: NonNull<NSNotification>| wake_sync(&handle));
+        let observer = unsafe {
+            NSWorkspace::sharedWorkspace().notificationCenter()
+                .addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
+        };
+        WORKSPACE_OBSERVERS.with(|slot| slot.borrow_mut().push(observer));
+    }
+    let probe_handle = app.clone();
+    std::thread::spawn(move || {
+        let mut previous_trust = None;
+        loop {
+            let state = probe_handle.state::<SidebarState>();
+            if state.stopped.load(Ordering::Relaxed) { break; }
+            let trusted = update_priority::is_trusted();
+            if previous_trust != Some(trusted) {
+                crate::log_lifecycle(&probe_handle, "update_priority_permission", if trusted { "accessibility=granted" } else { "accessibility=optional_unavailable" });
+                previous_trust = Some(trusted);
+            }
+            let target = state.updates.requested_target();
+            if let Some(target) = target {
+                let result = update_priority::probe(target);
+                if state.updates.record(target, result) {
+                    crate::log_lifecycle(&probe_handle, "update_priority", result.log_value());
+                }
+            }
+            // Keep the authorized probe cadence fast enough for update priority
+            // when a target appears; only unavailable permission can sleep longer.
+            std::thread::sleep(Duration::from_millis(if trusted { 200 } else { 2000 }));
+        }
+    });
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        if let Ok(mut worker) = handle.state::<SidebarState>().worker.lock() {
+            *worker = Some(std::thread::current());
+        }
+        loop {
+            let state = handle.state::<SidebarState>();
+            if state.stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            queue_sync(&handle);
+            // At most one pending tick. No WindowServer enumeration while inactive
+            // or detached, and no network requests in the positioning loop.
+            let tracking = state.tracking.load(Ordering::Relaxed);
+            std::thread::park_timeout(Duration::from_millis(if tracking { 80 } else { 500 }));
+        }
+    });
+}
+
+pub fn stop(app: &AppHandle) {
+    app.state::<SidebarState>()
+        .stopped
+        .store(true, Ordering::Relaxed);
+    wake_sync(app);
+    WORKSPACE_OBSERVERS.with(|slot| {
+        for observer in slot.borrow_mut().drain(..) {
+            // This is the same main-thread observer registered in start().
+            unsafe {
+                NSWorkspace::sharedWorkspace()
+                    .notificationCenter()
+                    .removeObserver((&*observer).as_ref());
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_core_foundation::{CGPoint, CGSize};
+
+    const SCREEN: Rect = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: 1440.0,
+        height: 900.0,
+    };
+    const HOST: Rect = Rect {
+        x: 120.0,
+        y: 50.0,
+        width: 1000.0,
+        height: 750.0,
+    };
+
+    #[test]
+    fn full_width_square_keeps_the_official_center_and_spacing() {
+        let badge = dock_frame(HOST, SCREEN, false).unwrap();
+        assert_eq!(
+            badge,
+            Rect {
+                x: 120.0,
+                y: 138.0,
+                width: 52.0,
+                height: 52.0
+            }
+        );
+        assert_eq!(badge.x + badge.width / 2.0, HOST.x + 26.0);
+        assert_eq!(badge.y + badge.height / 2.0 - (HOST.y + 70.0), 44.0);
+        assert_eq!((badge.width, badge.height), (52.0, 52.0));
+    }
+
+    #[test]
+    fn movement_and_resize_keep_badge_aligned_to_window_bottom() {
+        let moved = Rect {
+            x: 320.0,
+            y: 120.0,
+            width: 800.0,
+            height: 500.0,
+        };
+        let badge = dock_frame(moved, SCREEN, false).unwrap();
+        assert_eq!((badge.x, badge.y), (320.0, 208.0));
+        assert_eq!(
+            dock_frame(
+                Rect {
+                    height: 600.0,
+                    ..moved
+                },
+                SCREEN,
+                false
+            ),
+            Some(badge)
+        );
+    }
+
+    #[test]
+    fn expansion_and_collapse_preserve_anchor_without_covering_official_button() {
+        let expanded = dock_frame(HOST, SCREEN, true).unwrap();
+        let collapsed = dock_frame(HOST, SCREEN, false).unwrap();
+        assert_eq!((expanded.x, expanded.y), (collapsed.x, collapsed.y));
+        assert_eq!((expanded.width, expanded.height), (288.0, 288.0));
+    }
+
+    #[test]
+    fn extended_halo_preserves_both_core_centers() {
+        for expanded in [false, true] {
+            let core = dock_frame(HOST, SCREEN, expanded).unwrap();
+            let halo = halo_frame(core, expanded);
+            assert_eq!(halo.x + halo.width / 2.0, core.x + core.width / 2.0);
+            assert_eq!(halo.y + halo.height / 2.0, core.y + core.height / 2.0);
+            assert!(halo.contains(core));
+            assert_eq!(halo.width, if expanded { 508.0 } else { 132.0 });
+        }
+    }
+
+    #[test]
+    fn halo_may_extend_past_display_edge_without_shifting_the_badge() {
+        let host = Rect { x: 0.0, ..HOST };
+        let core = dock_frame(host, SCREEN, false).unwrap();
+        let halo = halo_frame(core, false);
+        assert_eq!(core.x + core.width / 2.0, 26.0);
+        assert_eq!(halo.x, -40.0);
+        assert_eq!(halo.x + halo.width / 2.0, 26.0);
+        assert!(SCREEN.contains(core));
+    }
+
+    #[test]
+    fn halo_tracks_the_clamped_expanded_core_on_secondary_displays() {
+        let screen = Rect { x: -1440.0, y: 900.0, ..SCREEN };
+        let host = Rect { x: -80.0, y: 1650.0, ..HOST };
+        let core = dock_frame(host, screen, true).unwrap();
+        let halo = halo_frame(core, true);
+        assert!(screen.contains(core));
+        assert_eq!((halo.x + 110.0, halo.y + 110.0), (core.x, core.y));
+    }
+
+    #[test]
+    fn secondary_displays_use_primary_origin_even_above_or_left_of_primary() {
+        let bounds = CGRect::new(CGPoint::new(-1200.0, -1000.0), CGSize::new(1000.0, 700.0));
+        let host = from_window_server(bounds, 900.0);
+        assert_eq!((host.x, host.y), (-1200.0, 1200.0));
+        let secondary = Rect {
+            x: -1440.0,
+            y: 900.0,
+            ..SCREEN
+        };
+        let badge = dock_frame(host, secondary, false).unwrap();
+        assert_eq!((badge.x, badge.y), (-1200.0, 1288.0));
+    }
+
+    #[test]
+    fn expanded_card_stays_on_display_and_offscreen_rail_hides() {
+        let near_edge = Rect {
+            x: 1320.0,
+            y: 650.0,
+            ..HOST
+        };
+        let card = dock_frame(near_edge, SCREEN, true).unwrap();
+        assert!(SCREEN.contains(card));
+        assert!(dock_frame(Rect { x: -100.0, ..HOST }, SCREEN, false).is_none());
+    }
+
+    #[test]
+    fn shows_new_target_only_after_its_bounds_have_settled() {
+        let now = Instant::now();
+        let host = HostWindow { id: 1, frame: HOST };
+        let mut motion = MotionGate::default();
+        assert!(!motion.accepts(host, false, now));
+        assert!(!motion.accepts(host, false, now + Duration::from_millis(349)));
+        assert!(motion.accepts(host, false, now + SETTLE_TIME));
+    }
+
+    #[test]
+    fn spaces_swipe_and_cancel_never_follow_intermediate_horizontal_frames() {
+        let now = Instant::now();
+        let host = HostWindow { id: 1, frame: HOST };
+        let mut motion = MotionGate::default();
+        assert!(!motion.accepts(host, false, now));
+        assert!(motion.accepts(host, false, now + SETTLE_TIME));
+        for (index, x) in [300.0, 700.0, 1100.0, 700.0, 300.0, HOST.x]
+            .into_iter()
+            .enumerate()
+        {
+            let intermediate = HostWindow {
+                frame: Rect { x, ..HOST },
+                ..host
+            };
+            assert!(!motion.accepts(
+                intermediate,
+                false,
+                now + Duration::from_millis(400 + index as u64 * 80)
+            ));
+        }
+        assert!(!motion.accepts(host, false, now + Duration::from_millis(1149)));
+        assert!(motion.accepts(host, false, now + Duration::from_millis(1150)));
+    }
+
+    #[test]
+    fn real_window_drag_still_tracks_without_waiting_for_settle() {
+        let now = Instant::now();
+        let host = HostWindow { id: 1, frame: HOST };
+        let mut motion = MotionGate::default();
+        motion.accepts(host, false, now);
+        assert!(motion.accepts(host, false, now + SETTLE_TIME));
+        let moved = HostWindow {
+            frame: Rect {
+                x: 320.0,
+                y: 100.0,
+                ..HOST
+            },
+            ..host
+        };
+        assert!(motion.accepts(moved, true, now + Duration::from_millis(400)));
+    }
+
+    #[test]
+    fn rapid_space_changes_restart_settling_even_with_identical_window_bounds() {
+        let now = Instant::now();
+        let host = HostWindow { id: 1, frame: HOST };
+        let mut motion = MotionGate::default();
+        motion.accepts(host, false, now);
+        assert!(motion.accepts(host, false, now + SETTLE_TIME));
+        motion.space_changed(now + Duration::from_millis(400));
+        assert!(!motion.accepts(host, false, now + Duration::from_millis(400)));
+        motion.space_changed(now + Duration::from_millis(600));
+        assert!(!motion.accepts(host, false, now + Duration::from_millis(600)));
+        assert!(!motion.accepts(host, false, now + Duration::from_millis(949)));
+        assert!(motion.accepts(host, false, now + Duration::from_millis(950)));
+    }
+
+    #[test]
+    fn returning_from_another_space_or_app_does_not_reuse_stale_position() {
+        let now = Instant::now();
+        let host = HostWindow { id: 1, frame: HOST };
+        let mut motion = MotionGate::default();
+        motion.accepts(host, false, now);
+        assert!(motion.accepts(host, false, now + SETTLE_TIME));
+        let another = HostWindow { id: 2, ..host };
+        assert!(!motion.accepts(another, true, now + Duration::from_millis(400)));
+        motion.clear_target();
+        assert!(!motion.accepts(host, false, now + Duration::from_millis(500)));
+        assert!(motion.accepts(host, false, now + Duration::from_millis(850)));
+    }
+
+    #[test]
+    fn clicking_widget_retains_its_existing_codex_host() {
+        let codex = target_scope(true, false, 100, None).unwrap();
+        assert!(codex.matches(Some(100), Some(7)));
+        let clicked_widget = target_scope(false, true, 200, Some(7)).unwrap();
+        assert!(clicked_widget.matches(Some(100), Some(7)));
+        assert!(!clicked_widget.matches(Some(100), Some(8)));
+        assert!(!clicked_widget.matches(Some(200), Some(9)));
+    }
+
+    #[test]
+    fn unrelated_apps_and_widget_without_a_host_do_not_attach() {
+        assert_eq!(target_scope(false, false, 300, Some(7)), None);
+        assert_eq!(target_scope(false, true, 200, None), None);
+    }
+}

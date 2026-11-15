@@ -1,0 +1,15 @@
+Glint — minimal macOS companion
+Formerly distributed as Quota Float
+
+Derived from Quota Float:
+https://github.com/change-42-yhmm/quota-float
+Copyright (c) 2026 Quota Float contributors
+Licensed under the MIT License; see LICENSE.
+
+This edition replaces the original card interface with a minimal sidebar quota
+surface and includes macOS companion lifecycle, continuous halo rendering,
+and reset-credit interactions. It is not an official OpenAI product.
+
+Instrument Serif and Manrope font subsets are distributed under the SIL Open
+Font License. Their license texts are included in src/assets/fonts and in the
+application bundle's licenses directory.
