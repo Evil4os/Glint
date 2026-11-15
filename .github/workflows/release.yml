@@ -1,0 +1,36 @@
+name: Draft test release
+on:
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - name: Check tag matches package version
+        run: node -e 'if (process.env.GITHUB_REF_NAME !== "v" + JSON.parse(require("fs").readFileSync("package.json")).version) process.exit(1)'
+      - run: npm test
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - run: npm run tauri -- build --target aarch64-apple-darwin --bundles app
+      - run: python3 scripts/package-macos.py
+      - run: python3 scripts/export-source.py
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/share/*
+          draft: true
+          prerelease: true
+          body_path: docs/RELEASE_TEMPLATE.md

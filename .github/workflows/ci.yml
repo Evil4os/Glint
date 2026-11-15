@@ -1,0 +1,33 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: npm test
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - run: npm run tauri -- build --target aarch64-apple-darwin --bundles app
+      - run: python3 scripts/package-macos.py
+      - run: python3 scripts/export-source.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glint-macos-arm64-test
+          path: release/share/*
+          if-no-files-found: error
+          retention-days: 14
