@@ -6,9 +6,15 @@
 
 没有菜单栏图标、Dock 图标、设置页或账户配置。只显示额度、重置时间和可用重置次数。
 
+## 效果预览
+
+![Glint 收起、浅色展开与深色展开效果](docs/images/Glint-preview.jpg)
+
+截图使用当前界面组件和模拟额度；背景为演示布局。
+
 ## 安装
 
-1. 从 [Releases](https://github.com/Evil4os/glint/releases/latest) 下载 `glint-*-macos-arm64-adhoc.zip`（Apple Silicon，macOS 15.2 或更新版本）。
+1. 从 [Releases](https://github.com/Evil4os/Glint/releases/latest) 下载 `glint-*-macos-arm64-adhoc.zip`（Apple Silicon，macOS 15.2 或更新版本）。
 2. 将 `Glint.app` 放入 `/Applications` 或 `~/Applications`，打开一次。
 3. 已登录的 Codex 打开后，额度会自动出现在边栏；点击查看详情，移开鼠标收起。
 
@@ -57,8 +63,6 @@ python3 scripts/package-macos.py
 
 图标源文件为 `src-tauri/icons/source.svg`，使用 `npm run tauri -- icon` 可重新生成；打包只引用 macOS 图标。`scripts/export-source.py` 会生成独立、干净的源码分享包，不包含工作区的本机产物。
 
-## 来源与许可
+## 许可
 
-本版基于 [change-42-yhmm/quota-float](https://github.com/change-42-yhmm/quota-float) 修改，保留 MIT 许可与原有版权声明，详见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。这是独立社区项目，并非 OpenAI 官方产品。
-
-更名兼容：内部应用标识及监听任务标识沿用 `app.quotafloat.desktop`，以保留既有状态；显示名称、图标和可执行文件均为 Glint。图标采用暖白底、柔蓝渐变与带星芒的小光点，不使用 OpenAI 官方标志。
+[MIT License](LICENSE) · [第三方声明](NOTICE)
