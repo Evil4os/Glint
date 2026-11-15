@@ -59,6 +59,23 @@ impl Rect {
             && other.y + other.height <= self.y + self.height
     }
 
+    fn contains_tool_surface(self, other: Self) -> bool {
+        if self.contains(other) && self != other {
+            return true;
+        }
+        // Browser surfaces can protrude beyond the host's edge. Treat a much
+        // smaller, mostly overlapping surface as a child even in that case;
+        // do not let a similarly sized independent main window take its place.
+        let area = other.width * other.height;
+        let overlap_width = (self.x + self.width).min(other.x + other.width)
+            - self.x.max(other.x);
+        let overlap_height = (self.y + self.height).min(other.y + other.height)
+            - self.y.max(other.y);
+        area > 0.0
+            && self.width * self.height >= area * 1.5
+            && overlap_width.max(0.0) * overlap_height.max(0.0) >= area * 0.8
+    }
+
     fn native(self) -> NSRect {
         NSRect::new(
             NSPoint::new(self.x, self.y),
@@ -296,7 +313,7 @@ fn select_host_window(
 ) -> Option<(HostWindow, i32)> {
     // Project popovers and other transient surfaces also appear as layer-zero
     // Codex windows. Browser/tool surfaces may be large enough to pass the size
-    // check, but sit inside the main window. Prefer their containing host, then
+    // check, but overlap the main window. Prefer their containing host, then
     // retain front-to-back order between independent main windows. Identical
     // frames are allowed while navigation replaces a native window.
     let windows: Vec<_> = windows.into_iter().filter(|(window, _)| {
@@ -304,7 +321,7 @@ fn select_host_window(
     }).collect();
     windows.iter().copied().find(|(window, pid)| {
         !windows.iter().any(|(other, other_pid)| {
-            other_pid == pid && other.frame != window.frame && other.frame.contains(window.frame)
+            other_pid == pid && other.frame.contains_tool_surface(window.frame)
         })
     })
 }
@@ -1029,5 +1046,39 @@ mod tests {
         assert_eq!(select_host_window([(inner, 100), (browser, 100), (main, 100)]), Some((main, 100)));
         let replacement = HostWindow { id: 10, ..main };
         assert_eq!(select_host_window([(replacement, 100), (main, 100)]), Some((replacement, 100)));
+    }
+
+    #[test]
+    fn browser_protruding_past_the_main_window_keeps_the_badge_on_the_main_rail() {
+        let main = HostWindow {
+            id: 1,
+            frame: Rect { x: 537.0, y: 0.0, width: 933.0, height: 923.0 },
+        };
+        let browser = HostWindow {
+            id: 2,
+            frame: Rect { x: 948.0, y: 529.0, width: 560.0, height: 392.0 },
+        };
+        // A real browser surface extended 38 points beyond its host's right
+        // edge. Strict containment accepted it as a new host and moved Glint.
+        assert!(!main.frame.contains(browser.frame));
+        assert!(main.frame.contains_tool_surface(browser.frame));
+        assert_eq!(select_host_window([(browser, 100), (main, 100)]), Some((main, 100)));
+    }
+
+    #[test]
+    fn similar_sized_or_separate_windows_preserve_the_frontmost_main_window() {
+        let background = HostWindow { id: 1, frame: HOST };
+        let similar = HostWindow {
+            id: 2,
+            frame: Rect { x: HOST.x + 50.0, width: HOST.width - 10.0, ..HOST },
+        };
+        assert!(!background.frame.contains_tool_surface(similar.frame));
+        let separate = HostWindow {
+            id: 3,
+            frame: Rect { x: HOST.x + HOST.width - 50.0, width: 500.0, height: 400.0, ..HOST },
+        };
+        assert!(!background.frame.contains_tool_surface(separate.frame));
+        assert_eq!(select_host_window([(similar, 100), (background, 100)]), Some((similar, 100)));
+        assert_eq!(select_host_window([(separate, 100), (background, 100)]), Some((separate, 100)));
     }
 }
