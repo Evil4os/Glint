@@ -68,7 +68,7 @@
   transition: opacity 70ms ease-out;
   pointer-events: none;
 }
-.quota-widget.is-expanded .quota-widget-backdrop { opacity: 1; }
+.quota-widget.is-expanded .quota-widget-backdrop { width: 140%; height: 130%; opacity: 1; }
 .quota-widget.is-expanded {
   --widget-ink: light-dark(#45535c, #edf2f5);
   --widget-muted: light-dark(#52616b, #c2cdd5);
@@ -107,13 +107,33 @@
   height: 161.538462%;
   filter: blur(7px);
 }
-.quota-widget.has-native-halo .quota-widget-cloud { visibility: hidden; }
-.quota-halo-surface { position: relative; width: 100%; height: 100%; overflow: hidden; container-type: inline-size; pointer-events: none; }
-.quota-halo-core { position: absolute; left: 40px; bottom: 40px; width: 52px; height: 52px; overflow: visible; }
-.quota-halo-core.is-expanded { width: var(--panel-size); height: var(--panel-size); }
-@container (min-width: 400px) {
-  .quota-halo-core { left: 110px; bottom: 110px; }
+.quota-halo-surface {
+  --halo-padding: var(--native-halo-padding, 40px);
+  --halo-core-size: 52px;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  container-type: inline-size;
+  pointer-events: none;
+  /* The widget paints the center itself. Cut the same native-window-sized
+     rectangle out of this decorative surface so both parts meet without
+     doubling the tint or depending on a second WebView for readable content. */
+  clip-path: polygon(evenodd,
+    var(--native-halo-left, 0px) var(--native-halo-top, 0px),
+    calc(100% - var(--native-halo-right, 0px)) var(--native-halo-top, 0px),
+    calc(100% - var(--native-halo-right, 0px)) calc(100% - var(--native-halo-bottom, 0px)),
+    var(--native-halo-left, 0px) calc(100% - var(--native-halo-bottom, 0px)),
+    var(--native-halo-left, 0px) var(--native-halo-top, 0px),
+    var(--halo-padding) calc(100% - var(--halo-padding) - var(--halo-core-size)),
+    calc(var(--halo-padding) + var(--halo-core-size)) calc(100% - var(--halo-padding) - var(--halo-core-size)),
+    calc(var(--halo-padding) + var(--halo-core-size)) calc(100% - var(--halo-padding)),
+    var(--halo-padding) calc(100% - var(--halo-padding)),
+    var(--halo-padding) calc(100% - var(--halo-padding) - var(--halo-core-size)));
 }
+.quota-halo-surface.is-expanded { --halo-padding: var(--native-halo-padding, 110px); --halo-core-size: 288px; }
+.quota-halo-core { position: absolute; left: var(--halo-padding); bottom: var(--halo-padding); width: 52px; height: 52px; overflow: visible; }
+.quota-halo-core.is-expanded { width: var(--panel-size); height: var(--panel-size); }
 .quota-widget.is-expanded .quota-widget-cloud {
   transform: translate3d(0, 0, 0) scale(1);
   transition-duration: 420ms;

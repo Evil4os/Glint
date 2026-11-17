@@ -60,7 +60,9 @@ export const QuotaWidget = memo(function QuotaWidget({ snapshot, preferences, ex
   const errorLabel = snapshot.status === "signed_out" ? "Sign in" : staleExpired ? "Out of date" : "Unavailable";
 
   useQuotaPalette(root, available ? primary : null);
-  const nativeHalo = useNativeHalo({ percent: available ? primary : null, expanded, sidebarDocked: docked });
+  // The input surface always paints its own color and reading backdrop.
+  // The companion WebView only extends that paint outside our click target.
+  useNativeHalo({ percent: available ? primary : null, expanded, sidebarDocked: docked });
 
   useEffect(() => {
     setNow(Date.now());
@@ -101,7 +103,7 @@ export const QuotaWidget = memo(function QuotaWidget({ snapshot, preferences, ex
   return (
     <main
       ref={root}
-      className={`quota-widget quota-widget--${anchor}${docked ? " is-docked" : ""}${expanded ? " is-expanded" : ""}${nativeHalo ? " has-native-halo" : ""}`}
+      className={`quota-widget quota-widget--${anchor}${docked ? " is-docked" : ""}${expanded ? " is-expanded" : ""}`}
       aria-label={available ? availableLabel : snapshot.message ?? t.unavailableStatus}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}

@@ -59,6 +59,14 @@ impl Rect {
             && other.y + other.height <= self.y + self.height
     }
 
+    fn intersection(self, other: Self) -> Option<Self> {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let width = (self.x + self.width).min(other.x + other.width) - x;
+        let height = (self.y + self.height).min(other.y + other.height) - y;
+        (width > 0.0 && height > 0.0).then_some(Self { x, y, width, height })
+    }
+
     fn contains_tool_surface(self, other: Self) -> bool {
         if self.contains(other) && self != other {
             return true;
@@ -125,6 +133,39 @@ fn halo_frame(core: Rect, expanded: bool) -> Rect {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HaloViewport {
+    padding: f64,
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+impl HaloViewport {
+    fn script(self) -> String {
+        format!("{{const s=document.documentElement?.style;if(s){{s.setProperty('--native-halo-padding','{}px');s.setProperty('--native-halo-left','{}px');s.setProperty('--native-halo-top','{}px');s.setProperty('--native-halo-right','{}px');s.setProperty('--native-halo-bottom','{}px');}}}}",
+            self.padding, self.left, self.top, self.right, self.bottom)
+    }
+}
+
+fn halo_viewport(core: Rect, host: Rect, screen: Rect, expanded: bool) -> HaloViewport {
+    let mut viewport = HaloViewport {
+        padding: if expanded { EXPANDED_HALO_PADDING } else { COLLAPSED_HALO_PADDING },
+        left: 0.0, top: 0.0, right: 0.0, bottom: 0.0,
+    };
+    if expanded {
+        let halo = halo_frame(core, true);
+        let visible = halo.intersection(host).and_then(|rect| rect.intersection(screen))
+            .unwrap_or(Rect { width: 0.0, height: 0.0, ..halo });
+        viewport.left = visible.x - halo.x;
+        viewport.bottom = visible.y - halo.y;
+        viewport.right = halo.x + halo.width - visible.x - visible.width;
+        viewport.top = halo.y + halo.height - visible.y - visible.height;
+    }
+    viewport
+}
+
 pub fn create_halo(app: &AppHandle) -> tauri::Result<()> {
     let halo = tauri::WebviewWindowBuilder::new(app, "halo", tauri::WebviewUrl::App("index.html".into()))
         .title("Glint Halo")
@@ -144,6 +185,8 @@ pub fn create_halo(app: &AppHandle) -> tauri::Result<()> {
     if let Some(widget) = app.get_webview_window("widget") {
         let handle = app.clone();
         widget.listen("quota-halo-ready", move |_| {
+            handle.state::<SidebarState>().halo_ready.store(true, Ordering::Relaxed);
+            wake_sync(&handle);
             crate::log_lifecycle(&handle, "halo_renderer_ready", "presentation_events=connected");
         });
     }
@@ -161,16 +204,17 @@ fn dock_frame(host: Rect, screen: Rect, expanded: bool) -> Option<Rect> {
     if !expanded {
         return Some(badge);
     }
-    if screen.width < EXPANDED_SIDE || screen.height < EXPANDED_SIDE {
+    let bounds = host.intersection(screen)?;
+    if bounds.width < EXPANDED_SIDE || bounds.height < EXPANDED_SIDE {
         return None;
     }
     Some(Rect {
         x: badge
             .x
-            .clamp(screen.x, screen.x + screen.width - EXPANDED_SIDE),
+            .clamp(bounds.x, bounds.x + bounds.width - EXPANDED_SIDE),
         y: badge
             .y
-            .clamp(screen.y, screen.y + screen.height - EXPANDED_SIDE),
+            .clamp(bounds.y, bounds.y + bounds.height - EXPANDED_SIDE),
         width: EXPANDED_SIDE,
         height: EXPANDED_SIDE,
     })
@@ -183,6 +227,7 @@ struct Layout {
     hidden_reason: Option<&'static str>,
     target_id: Option<u32>,
     motion: MotionGate,
+    halo_viewport: Option<HaloViewport>,
 }
 
 impl Layout {
@@ -204,6 +249,7 @@ pub struct SidebarState {
     stopped: AtomicBool,
     space_changed: AtomicBool,
     tracking: AtomicBool,
+    halo_ready: AtomicBool,
     worker: Mutex<Option<std::thread::Thread>>,
     updates: UpdatePriority,
 }
@@ -410,6 +456,9 @@ fn sync(app: &AppHandle) {
         return;
     };
     let now = Instant::now();
+    if state.halo_ready.swap(false, Ordering::Relaxed) {
+        layout.halo_viewport = None;
+    }
     if state.space_changed.swap(false, Ordering::Relaxed) {
         layout.motion.space_changed(now);
         state.updates.clear();
@@ -461,10 +510,12 @@ fn sync(app: &AppHandle) {
             }
             layout.expanded = false;
         }
-        dock_frame(host.frame, screen, layout.expanded).map(|frame| (host.id, frame))
+        dock_frame(host.frame, screen, layout.expanded).map(|frame| {
+            (host.id, frame, halo_viewport(frame, host.frame, screen, layout.expanded))
+        })
     });
 
-    if let Some((id, frame)) = placement {
+    if let Some((id, frame, viewport)) = placement {
         let target = frame.native();
         if native.frame() != target {
             let resized = native.frame().size != target.size;
@@ -496,6 +547,17 @@ fn sync(app: &AppHandle) {
                     } else {
                         "canvas=132 core=52 mouse_events=ignored"
                     });
+                }
+            }
+            if layout.halo_viewport != Some(viewport) {
+                if let Some(webview) = halo_window.as_ref() {
+                    if webview.eval(&viewport.script()).is_ok() {
+                        layout.halo_viewport = Some(viewport);
+                        crate::log_lifecycle(app, "halo_clip_updated", &format!(
+                            "padding={} left={} top={} right={} bottom={}",
+                            viewport.padding, viewport.left, viewport.top, viewport.right, viewport.bottom,
+                        ));
+                    }
                 }
             }
             // Both surfaces stay above Codex. The decorative surface always
@@ -570,6 +632,8 @@ pub fn apply_mode(app: &AppHandle) -> Result<(), String> {
             if let Ok(pointer) = halo_window.ns_window() {
                 let halo = unsafe { &*(pointer as *const NSWindow) };
                 halo.setLevel(NSFloatingWindowLevel);
+                halo.setHidesOnDeactivate(false);
+                halo.setPreservesContentDuringLiveResize(true);
                 halo.setIgnoresMouseEvents(true);
                 halo.setCollectionBehavior(
                     NSWindowCollectionBehavior::CanJoinAllSpaces
@@ -799,7 +863,7 @@ mod tests {
     #[test]
     fn halo_tracks_the_clamped_expanded_core_on_secondary_displays() {
         let screen = Rect { x: -1440.0, y: 900.0, ..SCREEN };
-        let host = Rect { x: -80.0, y: 1650.0, ..HOST };
+        let host = Rect { x: -700.0, y: 1100.0, ..HOST };
         let core = dock_frame(host, screen, true).unwrap();
         let halo = halo_frame(core, true);
         assert!(screen.contains(core));
@@ -823,13 +887,59 @@ mod tests {
     #[test]
     fn expanded_card_stays_on_display_and_offscreen_rail_hides() {
         let near_edge = Rect {
-            x: 1320.0,
-            y: 650.0,
+            x: 1000.0,
+            y: 250.0,
             ..HOST
         };
         let card = dock_frame(near_edge, SCREEN, true).unwrap();
         assert!(SCREEN.contains(card));
+        assert!(near_edge.contains(card));
+        assert!(dock_frame(Rect { x: 1320.0, y: 650.0, ..HOST }, SCREEN, true).is_none());
         assert!(dock_frame(Rect { x: -100.0, ..HOST }, SCREEN, false).is_none());
+    }
+
+    #[test]
+    fn observed_client_expands_from_the_badge_and_clips_the_exterior_paint() {
+        let host = Rect { x: 537.0, y: 0.0, width: 933.0, height: 923.0 };
+        let screen = Rect { width: 1470.0, height: 956.0, ..SCREEN };
+        let collapsed = dock_frame(host, screen, false).unwrap();
+        let expanded = dock_frame(host, screen, true).unwrap();
+        assert_eq!((expanded.x, expanded.y), (collapsed.x, collapsed.y));
+        assert_eq!((expanded.x, expanded.y), (537.0, 88.0));
+        let clip = halo_viewport(expanded, host, screen, true);
+        assert_eq!(clip, HaloViewport { padding: 110.0, left: 110.0, top: 0.0, right: 0.0, bottom: 22.0 });
+    }
+
+    #[test]
+    fn expanded_halo_paint_stays_inside_client_and_display_without_moving_the_badge() {
+        let secondary = Rect { x: -1440.0, y: 900.0, ..SCREEN };
+        for (host, screen) in [
+            (HOST, SCREEN),
+            (Rect { x: 1000.0, y: 250.0, ..HOST }, SCREEN),
+            (Rect { y: -70.0, ..HOST }, SCREEN),
+            (Rect { x: -700.0, y: 1100.0, ..HOST }, secondary),
+            (Rect { width: 480.0, height: 360.0, ..HOST }, SCREEN),
+        ] {
+            let core = dock_frame(host, screen, true).unwrap();
+            let halo = halo_frame(core, true);
+            let clip = halo_viewport(core, host, screen, true);
+            let paint = Rect {
+                x: halo.x + clip.left,
+                y: halo.y + clip.bottom,
+                width: halo.width - clip.left - clip.right,
+                height: halo.height - clip.top - clip.bottom,
+            };
+            assert!(paint.contains(core));
+            assert!(host.contains(paint));
+            assert!(screen.contains(paint));
+        }
+    }
+
+    #[test]
+    fn collapsed_halo_retains_its_existing_falloff_outside_the_client() {
+        let core = dock_frame(HOST, SCREEN, false).unwrap();
+        let clip = halo_viewport(core, HOST, SCREEN, false);
+        assert_eq!(clip, HaloViewport { padding: 40.0, left: 0.0, top: 0.0, right: 0.0, bottom: 0.0 });
     }
 
     #[test]

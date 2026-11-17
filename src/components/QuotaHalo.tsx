@@ -5,7 +5,7 @@ import { useQuotaPalette } from "../lib/use-quota-palette";
 export function QuotaHalo({ state }: { state: HaloPresentation }) {
   const root = useRef<HTMLDivElement>(null);
   useQuotaPalette(root, state.percent);
-  return <main className="quota-halo-surface" aria-hidden="true">
+  return <main className={`quota-halo-surface${state.expanded ? " is-expanded" : ""}`} aria-hidden="true">
     <div ref={root} className={`quota-widget quota-halo-core quota-widget--bottom-left is-docked${state.expanded ? " is-expanded" : ""}`}>
       <div className="quota-widget-panel"><div className="quota-widget-cloud"><div className="quota-widget-backdrop" /></div></div>
     </div>
