@@ -107,12 +107,36 @@ fn finish_lifecycle_log(app: &AppHandle) {
 }
 
 #[tauri::command]
-async fn consume_reset_credit(window: tauri::WebviewWindow, state: State<'_, AppState>, idempotency_key: String) -> Result<reset_credit::Redemption, String> {
-    if window.label() != "widget" { return Err("notAllowed".into()); }
+fn has_pending_reset_credit(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    idempotency_key: String,
+) -> Result<bool, String> {
+    if window.label() != "widget" {
+        return Err("notAllowed".into());
+    }
+    reset_credit::has_attempt(&state.data_dir.join("reset-attempt.json"), &idempotency_key)
+}
+
+#[tauri::command]
+async fn consume_reset_credit(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    idempotency_key: String,
+    retry: bool,
+) -> Result<reset_credit::Redemption, String> {
+    if window.label() != "widget" {
+        return Err("notAllowed".into());
+    }
     let _reset = state.reset_lock.try_lock().map_err(|_| "alreadyInProgress")?;
     let _fetch = state.fetch_lock.lock().await;
     let path = state.data_dir.join("reset-attempt.json");
-    let result = reset_credit::consume(&idempotency_key, &path).await;
+    let result = reset_credit::consume(&idempotency_key, &path, retry).await;
+    let details = match &result {
+        Ok(redemption) => format!("outcome={}", redemption.outcome),
+        Err(code) => format!("error={code}"),
+    };
+    append_lifecycle_log(&state.lifecycle_log_path, "reset_credit", &details);
     if let Ok(mut cache) = state.snapshot_cache.lock() { *cache = None; }
     result
 }
@@ -240,6 +264,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_snapshots,
             refresh_snapshots,
+            has_pending_reset_credit,
             consume_reset_credit,
             set_widget_expanded,
         ])

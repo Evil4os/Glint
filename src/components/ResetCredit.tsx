@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { pendingResetKey, redeemResetCredit, resetErrorMessage, resetMessages } from "../lib/reset-credit";
+import { pendingResetKey, reconcilePendingReset, redeemResetCredit, resetErrorMessage, resetMessages } from "../lib/reset-credit";
 
 interface Props {
   credits: number | null;
@@ -17,6 +17,17 @@ export function ResetCredit({ credits, expanded, onComplete, onInteraction }: Pr
   const trigger = useRef<HTMLButtonElement>(null);
   const confirm = useRef<HTMLButtonElement>(null);
   const restoreFocus = useRef(false);
+
+  useEffect(() => {
+    if (!retry) return;
+    let active = true;
+    void reconcilePendingReset().then((pending) => {
+      if (pending || !active || inFlight.current) return;
+      setRetry(false);
+      setConfirming(false);
+    }).catch(() => { /* Keep the retry if the local record could not be checked. */ });
+    return () => { active = false; };
+  }, [retry]);
 
   useEffect(() => {
     onInteraction?.(confirming || busy);
@@ -40,16 +51,20 @@ export function ResetCredit({ credits, expanded, onComplete, onInteraction }: Pr
     setBusy(true);
     setMessage(null);
     try {
-      const result = await redeemResetCredit();
+      const result = await redeemResetCredit(retry);
       setRetry(false);
-      const labels = { reset: "Reset used", alreadyRedeemed: "Already reset", nothingToReset: "Not eligible", noCredit: "No resets" };
+      const labels = { reset: "Reset used", alreadyRedeemed: "Already reset", nothingToReset: "Not eligible", noCredit: "No resets", notStarted: "No pending reset" };
       setMessage({ text: labels[result.outcome], detail: resetMessages[result.outcome] + (result.refreshed ? "" : "，额度稍后刷新") });
       close();
     } catch (error) {
-      setRetry(true);
+      const pending = await reconcilePendingReset().catch(() => {
+        try { return Boolean(pendingResetKey()); } catch { return retry; }
+      });
+      setRetry(pending);
+      if (!pending) close();
       const code = error instanceof Error ? error.message : String(error);
-      const labels: Record<string, string> = { cliUnavailable: "Codex CLI required", creditDetailsUnavailable: "Details unavailable", previewOnly: "Preview only", attemptStorage: "Storage unavailable" };
-      setMessage({ text: labels[code] ?? "Unconfirmed · Retry", detail: resetErrorMessage(error) });
+      const labels: Record<string, string> = { cliUnavailable: "Codex CLI required", appServerUnavailable: "Reset service unavailable", creditDetailsUnavailable: "Details unavailable", previewOnly: "Preview only", attemptStorage: "Storage unavailable" };
+      setMessage({ text: labels[code] ?? (pending ? "Unconfirmed · Retry" : "Reset unavailable"), detail: resetErrorMessage(error) });
     } finally {
       // Refresh on uncertain results too; never locally subtract a card or set quota to 100.
       try { await onComplete?.(); } catch { /* normal polling will retry */ }

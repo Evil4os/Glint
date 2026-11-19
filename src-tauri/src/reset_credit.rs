@@ -1,8 +1,14 @@
 //! User-initiated redemptions through the documented Codex App Server protocol.
 //! Never called by polling; no model/thread is started. Raw responses are not logged.
+use crate::companion::CODEX_BUNDLE_ID;
+use objc2::rc::autoreleasepool;
+use objc2_app_kit::{NSRunningApplication, NSWorkspace};
+use objc2_foundation::NSString;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    env, fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::Stdio,
 };
@@ -74,20 +80,33 @@ async fn rpc<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 }
 
-fn prepare_attempt(path: &Path, key: &str, limits: &Value) -> Result<Option<Attempt>, String> {
-    if path.exists() {
-        let saved: Attempt =
-            serde_json::from_slice(&std::fs::read(path).map_err(|_| "attemptStorage")?)
-                .map_err(|_| "attemptStorage")?;
-        // A retry always targets the same credit, even after it disappears from the
-        // available list. This also prevents an account switch from spending a different card.
-        if saved.key == key {
-            return Ok(Some(saved));
-        }
-    }
+fn saved_attempt(path: &Path, key: &str) -> Result<Option<Attempt>, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("attemptStorage".into()),
+    };
+    let saved: Attempt = serde_json::from_slice(&bytes).map_err(|_| "attemptStorage")?;
+    Ok((saved.key == key && !saved.credit_id.is_empty()).then_some(saved))
+}
+
+pub fn has_attempt(path: &Path, key: &str) -> Result<bool, String> {
+    Ok(valid_key(key) && saved_attempt(path, key)?.is_some())
+}
+
+fn prepare_attempt(
+    path: &Path,
+    key: &str,
+    limits: &Value,
+    saved: Option<Attempt>,
+) -> Result<Option<Attempt>, String> {
     let summary = &limits["rateLimitResetCredits"];
     if summary["availableCount"].as_u64() == Some(0) {
         return Ok(None);
+    }
+    // A retry always targets the original credit, including when the list is incomplete.
+    if saved.is_some() {
+        return Ok(saved);
     }
     let credit = summary["credits"]
         .as_array()
@@ -105,12 +124,12 @@ fn prepare_attempt(path: &Path, key: &str, limits: &Value) -> Result<Option<Atte
     };
     // Commit before any request that can consume a card. Failure prevents redemption.
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| "attemptStorage")?;
+        fs::create_dir_all(parent).map_err(|_| "attemptStorage")?;
     }
     let temp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec(&attempt).map_err(|_| "attemptStorage")?;
     use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
+    let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
@@ -121,7 +140,7 @@ fn prepare_attempt(path: &Path, key: &str, limits: &Value) -> Result<Option<Atte
     file.write_all(&bytes)
         .and_then(|_| file.sync_all())
         .map_err(|_| "attemptStorage")?;
-    std::fs::rename(temp, path).map_err(|_| "attemptStorage")?;
+    fs::rename(temp, path).map_err(|_| "attemptStorage")?;
     Ok(Some(attempt))
 }
 
@@ -130,16 +149,25 @@ async fn exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     writer: &mut W,
     key: &str,
     path: &Path,
+    saved: Option<Attempt>,
 ) -> Result<Redemption, String> {
     let result = timeout(Duration::from_secs(35), async {
-        rpc(reader, writer, 1, "initialize", json!({"clientInfo":{"name":"glint","title":"Glint","version":env!("CARGO_PKG_VERSION")}})).await?;
-        writer.write_all(b"{\"method\":\"initialized\",\"params\":{}}\n").await.map_err(|_| "connectionLost")?;
-        let limits = rpc(reader, writer, 2, "account/rateLimits/read", json!({})).await?;
-        let Some(attempt) = prepare_attempt(path, key, &limits)? else {
-            return Ok::<Value, String>(json!({"outcome":"noCredit"}));
+        rpc(reader, writer, 1, "initialize", json!({"clientInfo":{"name":"glint","title":"Glint","version":env!("CARGO_PKG_VERSION")}}))
+            .await.map_err(|_| "appServerUnavailable")?;
+        writer.write_all(b"{\"method\":\"initialized\",\"params\":{}}\n").await.map_err(|_| "appServerUnavailable")?;
+        let limits = rpc(reader, writer, 2, "account/rateLimits/read", json!({}))
+            .await.map_err(|_| "creditDetailsUnavailable")?;
+        let Some(attempt) = prepare_attempt(path, key, &limits, saved)? else {
+            return Ok(None);
         };
-        rpc(reader, writer, 3, "account/rateLimitResetCredit/consume", json!({"idempotencyKey":attempt.key,"creditId":attempt.credit_id})).await
+        rpc(reader, writer, 3, "account/rateLimitResetCredit/consume", json!({"idempotencyKey":attempt.key,"creditId":attempt.credit_id})).await.map(Some)
     }).await.map_err(|_| "requestTimeout")??;
+    let Some(result) = result else {
+        return Ok(Redemption {
+            outcome: "noCredit".into(),
+            refreshed: true,
+        });
+    };
     let outcome = result["outcome"]
         .as_str()
         .filter(|s| ["reset", "alreadyRedeemed", "nothingToReset", "noCredit"].contains(s))
@@ -156,26 +184,73 @@ async fn exchange<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(Redemption { outcome, refreshed })
 }
 
-fn cli_path() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        let local = home.join(".local/bin/codex");
-        if local.is_file() {
-            return local;
-        }
-    }
-    for path in ["/opt/homebrew/bin/codex", "/usr/local/bin/codex"] {
-        if Path::new(path).is_file() {
-            return path.into();
-        }
-    }
-    "codex".into()
+fn desktop_cli_path(bundle: &Path) -> Option<PathBuf> {
+    let resources = bundle.join("Contents/Resources");
+    ["codex-cli/CodexCLI.app/Contents/MacOS/codex", "codex"]
+        .into_iter()
+        .map(|relative| resources.join(relative))
+        .find(|path| path.is_file())
 }
 
-pub async fn consume(key: &str, path: &Path) -> Result<Redemption, String> {
+fn find_desktop_cli() -> Option<PathBuf> {
+    autoreleasepool(|_| {
+        let bundle_id = NSString::from_str(CODEX_BUNDLE_ID);
+        NSRunningApplication::runningApplicationsWithBundleIdentifier(&bundle_id)
+            .iter()
+            .filter(|app| !app.isTerminated())
+            .filter_map(|app| app.bundleURL()?.to_file_path())
+            .find_map(|bundle| desktop_cli_path(&bundle))
+            .or_else(|| {
+                let bundle = NSWorkspace::sharedWorkspace()
+                    .URLForApplicationWithBundleIdentifier(&bundle_id)?
+                    .to_file_path()?;
+                desktop_cli_path(&bundle)
+            })
+    })
+}
+
+fn cli_command() -> Command {
+    if let Some(cli) = find_desktop_cli() {
+        return Command::new(cli);
+    }
+
+    let bin_dirs: Vec<_> = dirs::home_dir()
+        .map(|home| home.join(".local/bin"))
+        .into_iter()
+        .chain(["/opt/homebrew/bin".into(), "/usr/local/bin".into()])
+        .collect();
+    let cli = bin_dirs
+        .iter()
+        .map(|dir| dir.join("codex"))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| "codex".into());
+    let mut command = Command::new(cli);
+    // npm launchers resolve Node through env, even when Codex was found by absolute path.
+    let inherited = env::var_os("PATH").unwrap_or_default();
+    if let Ok(path) = env::join_paths(
+        env::split_paths(&inherited)
+            .filter(|path| !path.as_os_str().is_empty())
+            .chain(bin_dirs),
+    ) {
+        command.env("PATH", path);
+    }
+    command
+}
+
+pub async fn consume(key: &str, path: &Path, retry: bool) -> Result<Redemption, String> {
     if !valid_key(key) {
         return Err("invalidKey".into());
     }
-    let mut child = Command::new(cli_path())
+    let saved = saved_attempt(path, key)?;
+    if retry && saved.is_none() {
+        // Older versions saved the WebView key before finding a credit. An orphaned
+        // retry key must never authorize the selection of a new card.
+        return Ok(Redemption {
+            outcome: "notStarted".into(),
+            refreshed: false,
+        });
+    }
+    let mut child = cli_command()
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -192,7 +267,7 @@ pub async fn consume(key: &str, path: &Path) -> Result<Redemption, String> {
             .ok_or("connectionLost")?
             .take(1024 * 1024),
     );
-    let result = exchange(&mut output, &mut input, key, path).await;
+    let result = exchange(&mut output, &mut input, key, path, saved).await;
     drop(input);
     let _ = child.kill().await;
     let _ = timeout(Duration::from_secs(2), child.wait()).await;
@@ -214,20 +289,59 @@ mod tests {
         let path = path("retry");
         let _ = std::fs::remove_file(&path);
         assert_eq!(
-            prepare_attempt(&path, KEY, &limits("first"))
+            prepare_attempt(&path, KEY, &limits("first"), None)
                 .unwrap()
                 .unwrap()
                 .credit_id,
             "first"
         );
         assert_eq!(
-            prepare_attempt(&path, KEY, &limits("second"))
-                .unwrap()
-                .unwrap()
-                .credit_id,
+            prepare_attempt(
+                &path,
+                KEY,
+                &limits("second"),
+                saved_attempt(&path, KEY).unwrap()
+            )
+            .unwrap()
+            .unwrap()
+            .credit_id,
             "first"
         );
+        assert!(prepare_attempt(
+            &path,
+            KEY,
+            &json!({"rateLimitResetCredits":{"availableCount":0}}),
+            saved_attempt(&path, KEY).unwrap(),
+        )
+        .unwrap()
+        .is_none());
         let _ = std::fs::remove_file(path);
+    }
+    #[tokio::test]
+    async fn retry_for_unsubmitted_key_returns_before_starting_the_cli() {
+        let path = path("unsubmitted");
+        let _ = fs::remove_file(&path);
+        assert!(!has_attempt(&path, KEY).unwrap());
+        let other_key = "87654321-1234-4234-8234-123456789abc";
+        prepare_attempt(&path, other_key, &limits("previous-credit"), None).unwrap();
+        assert!(!has_attempt(&path, KEY).unwrap());
+        let result = consume(KEY, &path, true).await.unwrap();
+        assert_eq!(result.outcome, "notStarted");
+        assert!(has_attempt(&path, other_key).unwrap());
+        let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn prefers_native_cli_in_current_bundle_layout() {
+        let bundle = path("renamed-desktop.app");
+        let resources = bundle.join("Contents/Resources");
+        let current_cli = resources.join("codex-cli/CodexCLI.app/Contents/MacOS/codex");
+        let old_cli = resources.join("codex");
+        fs::create_dir_all(current_cli.parent().unwrap()).unwrap();
+        fs::write(&old_cli, "").unwrap();
+        assert_eq!(desktop_cli_path(&bundle), Some(old_cli));
+        fs::write(&current_cli, "").unwrap();
+        assert_eq!(desktop_cli_path(&bundle), Some(current_cli));
+        fs::remove_dir_all(bundle).unwrap();
     }
     #[test]
     fn missing_credit_details_fail_closed_and_zero_is_not_redeemed() {
@@ -235,13 +349,15 @@ mod tests {
         assert!(prepare_attempt(
             &path,
             KEY,
-            &json!({"rateLimitResetCredits":{"availableCount":1}})
+            &json!({"rateLimitResetCredits":{"availableCount":1}}),
+            None,
         )
         .is_err());
         assert!(prepare_attempt(
             &path,
             KEY,
-            &json!({"rateLimitResetCredits":{"availableCount":0}})
+            &json!({"rateLimitResetCredits":{"availableCount":0}}),
+            None,
         )
         .unwrap()
         .is_none());
@@ -302,7 +418,7 @@ mod tests {
                     ]
                 );
             });
-            let result = exchange(&mut BufReader::new(r), &mut w, KEY, &path)
+            let result = exchange(&mut BufReader::new(r), &mut w, KEY, &path, None)
                 .await
                 .unwrap();
             assert_eq!(result.outcome, outcome);
@@ -342,7 +458,7 @@ mod tests {
                     .unwrap();
             }
         });
-        let result = exchange(&mut BufReader::new(r), &mut w, KEY, &path)
+        let result = exchange(&mut BufReader::new(r), &mut w, KEY, &path, None)
             .await
             .unwrap();
         assert_eq!(result.outcome, "reset");

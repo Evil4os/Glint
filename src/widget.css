@@ -1,3 +1,8 @@
+:where(.quota-widget, .quota-halo-surface) {
+  --paint-mask-stops: transparent, #0003 5%, #000c 13%, #000 18%, #000 82%, #000c 87%, #0003 95%, transparent;
+  --paint-mask-x: linear-gradient(to right, var(--paint-mask-stops));
+  --paint-mask-y: linear-gradient(to bottom, var(--paint-mask-stops));
+}
 .quota-widget {
   --panel-size: 288px;
   --detail-scale: .847058824;
@@ -41,6 +46,12 @@
   transform: translate3d(var(--cloud-x), var(--cloud-y), 0) scale(var(--cloud-scale));
   transform-origin: center;
   transition: transform 300ms cubic-bezier(.2, .88, .24, 1);
+}
+/* Feather the local paint on all four sides, including when the companion
+   surface hasn't drawn yet. The mask scales with the cloud during expansion. */
+.quota-widget:not(.quota-halo-core) .quota-widget-cloud {
+  mask-image: var(--paint-mask-x), var(--paint-mask-y);
+  mask-composite: intersect;
 }
 /* A web backdrop filter cannot blur another native window. Concentrate the
    paper behind the data, then let it disperse across the companion canvas.
@@ -116,20 +127,15 @@
   overflow: hidden;
   container-type: inline-size;
   pointer-events: none;
-  /* The widget paints the center itself. Cut the same native-window-sized
-     rectangle out of this decorative surface so both parts meet without
-     doubling the tint or depending on a second WebView for readable content. */
-  clip-path: polygon(evenodd,
-    var(--native-halo-left, 0px) var(--native-halo-top, 0px),
-    calc(100% - var(--native-halo-right, 0px)) var(--native-halo-top, 0px),
-    calc(100% - var(--native-halo-right, 0px)) calc(100% - var(--native-halo-bottom, 0px)),
-    var(--native-halo-left, 0px) calc(100% - var(--native-halo-bottom, 0px)),
-    var(--native-halo-left, 0px) var(--native-halo-top, 0px),
-    var(--halo-padding) calc(100% - var(--halo-padding) - var(--halo-core-size)),
-    calc(var(--halo-padding) + var(--halo-core-size)) calc(100% - var(--halo-padding) - var(--halo-core-size)),
-    calc(var(--halo-padding) + var(--halo-core-size)) calc(100% - var(--halo-padding)),
-    var(--halo-padding) calc(100% - var(--halo-padding)),
-    var(--halo-padding) calc(100% - var(--halo-padding) - var(--halo-core-size)));
+  clip-path: inset(var(--native-halo-top, 0px) var(--native-halo-right, 0px)
+    var(--native-halo-bottom, 0px) var(--native-halo-left, 0px));
+  /* Subtract the widget's feathered mask from the halo. At the window edge,
+     the widget is fully transparent and the halo carries the entire gradient. */
+  mask-image: linear-gradient(black, black), var(--paint-mask-x), var(--paint-mask-y);
+  mask-size: 100% 100%, var(--halo-core-size) var(--halo-core-size), var(--halo-core-size) var(--halo-core-size);
+  mask-position: 0 0, left var(--halo-padding) bottom var(--halo-padding), left var(--halo-padding) bottom var(--halo-padding);
+  mask-repeat: no-repeat;
+  mask-composite: subtract, intersect;
 }
 .quota-halo-surface.is-expanded { --halo-padding: var(--native-halo-padding, 110px); --halo-core-size: 288px; }
 .quota-halo-core { position: absolute; left: var(--halo-padding); bottom: var(--halo-padding); width: 52px; height: 52px; overflow: visible; }

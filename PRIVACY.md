@@ -4,7 +4,7 @@ Glint is a local macOS companion. It has no analytics, advertising, developer-op
 
 The quota process reads the existing Codex authentication file under `CODEX_HOME` or `~/.codex`. It uses the existing access token to query Codex/ChatGPT quota endpoints. Authentication files are read-only: the app does not rewrite them, export them, or send them to the project maintainer. Network errors retain the last valid snapshot as stale; signed-out results clear it.
 
-Reset-credit redemption is only initiated by clicking the count and confirming. It uses a locally installed Codex CLI's App Server protocol. An idempotency key and selected credit identifier are stored locally to support safe retries; uncertain results are not treated as successful resets.
+Reset-credit redemption is only initiated by clicking the count and confirming. It uses the Codex App Server protocol through the CLI bundled with Codex Desktop, with a locally installed CLI as a fallback. An idempotency key and selected credit identifier are stored locally for retries of the same credit.
 
 The main widget observes running applications and Codex window bounds for placement. It does not take screenshots or read conversations. If Accessibility permission was granted separately, it checks the role and label of the overlapping update control; it never asks for that permission automatically. Otherwise it compares the bundle identifier and build number of the running app and any staged Codex updater bundles. It does not modify the updater cache or trigger updates.
 

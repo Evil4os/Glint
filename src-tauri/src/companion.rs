@@ -6,7 +6,7 @@ use objc2_foundation::{NSDate, NSRunLoop};
 use std::{fs, path::{Path, PathBuf}, process::Command, time::{Duration, Instant}};
 
 const LABEL: &str = "app.quotafloat.desktop.watch";
-const HOST: &str = "com.openai.codex";
+pub(crate) const CODEX_BUNDLE_ID: &str = "com.openai.codex";
 
 #[derive(Debug, PartialEq)]
 enum Action { Start, Stop, Wait }
@@ -89,7 +89,7 @@ fn unregister(home: &Path) -> Result<(), String> {
 
 fn host_running() -> bool {
     NSWorkspace::sharedWorkspace().runningApplications().iter().any(|app|
-        app.bundleIdentifier().is_some_and(|id| id.to_string() == HOST) && !app.isTerminated())
+        app.bundleIdentifier().is_some_and(|id| id.to_string() == CODEX_BUNDLE_ID) && !app.isTerminated())
 }
 
 fn watch(executable: &Path, bundle: &Path) {
@@ -105,7 +105,7 @@ fn watch(executable: &Path, bundle: &Path) {
                         .is_some_and(|path| Path::new(&path.to_string()) == executable)
             }).collect();
             let host = apps.iter().any(|app|
-                app.bundleIdentifier().is_some_and(|id| id.to_string() == HOST) && !app.isTerminated());
+                app.bundleIdentifier().is_some_and(|id| id.to_string() == CODEX_BUNDLE_ID) && !app.isTerminated());
             match action(host, !widgets.is_empty(), last_start.is_some_and(|t| t.elapsed() < Duration::from_secs(15))) {
                 Action::Start => {
                     last_start = Some(Instant::now());
