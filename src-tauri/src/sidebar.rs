@@ -1,6 +1,6 @@
 //! A companion window aligned to the Codex rail. This never changes Codex files
 //! or reads chat content. Window bounds come from WindowServer, in points;
-//! update-control presence comes from narrow, read-only accessibility queries.
+//! update priority comes from read-only accessibility queries or staged bundle metadata.
 
 use crate::update_priority::{self, UpdatePriority, UpdateTarget};
 
@@ -479,20 +479,20 @@ fn sync(app: &AppHandle) {
     }
     let mut hidden_reason = resolution.err().unwrap_or("reason=host_window_unavailable");
     let placement = target.and_then(|(host, pid)| {
+        let yields_to_update = state.updates.should_yield(UpdateTarget {
+            pid,
+            window_id: host.id,
+            x: (host.frame.x + RAIL_CENTER_X) as f32,
+            y: (primary_top? - host.frame.y - BADGE_CENTER_FROM_BOTTOM) as f32,
+        });
         hidden_reason = "reason=host_window_settling";
         if !layout
             .motion
             .accepts(host, NSEvent::pressedMouseButtons() & 1 != 0, now)
         {
-            state.updates.clear();
             return None;
         }
-        if state.updates.should_yield(UpdateTarget {
-            pid,
-            window_id: host.id,
-            x: (host.frame.x + RAIL_CENTER_X) as f32,
-            y: (primary_top? - host.frame.y - BADGE_CENTER_FROM_BOTTOM) as f32,
-        }) {
+        if yields_to_update {
             hidden_reason = "reason=app_update_priority";
             return None;
         }
@@ -725,14 +725,14 @@ pub fn start(app: &AppHandle) {
             }
             let target = state.updates.requested_target();
             if let Some(target) = target {
-                let result = update_priority::probe(target);
+                let result = update_priority::probe(target, trusted);
                 if state.updates.record(target, result) {
-                    crate::log_lifecycle(&probe_handle, "update_priority", result.log_value());
+                    let source = if trusted { "accessibility" } else { "sparkle_stage" };
+                    crate::log_lifecycle(&probe_handle, "update_priority", &format!("{} source={source}", result.log_value()));
+                    wake_sync(&probe_handle);
                 }
             }
-            // Keep the authorized probe cadence fast enough for update priority
-            // when a target appears; only unavailable permission can sleep longer.
-            std::thread::sleep(Duration::from_millis(if trusted { 200 } else { 2000 }));
+            std::thread::sleep(Duration::from_millis(if trusted { 200 } else { 250 }));
         }
     });
     let handle = app.clone();

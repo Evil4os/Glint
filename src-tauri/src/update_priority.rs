@@ -1,14 +1,20 @@
-//! Yield the existing sidebar slot to the app's update progress/restart control.
-//! Read only control roles and labels, never screenshots or document text.
+//! Yield the sidebar slot to the app's update control. Without Accessibility,
+//! check the updater's staged bundle metadata instead of reading the screen.
 
-use objc2_core_foundation::{CFRetained, CFString, CFType};
+use objc2::rc::autoreleasepool;
+use objc2_app_kit::NSRunningApplication;
+use objc2_core_foundation::{CFBundle, CFRetained, CFString, CFType, CFURL};
 use std::{
+    fs,
+    path::{Path, PathBuf},
     ptr::NonNull,
     sync::Mutex,
     time::{Duration, Instant},
 };
 
 const RESTORE_DELAY: Duration = Duration::from_millis(350);
+const CODEX_BUNDLE_ID: &str = "com.openai.codex";
+const SPARKLE_INSTALLATION: &str = "org.sparkle-project.Sparkle/Installation";
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -134,6 +140,70 @@ pub(crate) fn is_trusted() -> bool {
     unsafe { AXIsProcessTrusted() != 0 }
 }
 
+fn codex_build(app: &Path) -> Option<u64> {
+    let url = CFURL::from_directory_path(app)?;
+    let info = CFBundle::info_dictionary_in_directory(Some(&url))?;
+    let info = unsafe { info.cast_unchecked::<CFString, CFType>() };
+    let identifier = info.get(&CFString::from_str("CFBundleIdentifier"))?;
+    if identifier.downcast_ref::<CFString>()?.to_string() != CODEX_BUNDLE_ID {
+        return None;
+    }
+    let build = info.get(&CFString::from_str("CFBundleVersion"))?;
+    build.downcast_ref::<CFString>()?.to_string().parse().ok()
+}
+
+fn directories(entries: fs::ReadDir) -> impl Iterator<Item = PathBuf> {
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+}
+
+fn probe_staged_update(
+    installation: &Path,
+    running_build: impl FnOnce() -> Option<u64>,
+) -> Observation {
+    let stages = match fs::read_dir(installation) {
+        Ok(stages) => stages,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Observation::Clear,
+        Err(_) => return Observation::Unavailable,
+    };
+    let staged_build = directories(stages)
+        .flat_map(|stage| fs::read_dir(stage).into_iter().flat_map(directories))
+        .flat_map(|payload| fs::read_dir(payload).into_iter().flat_map(directories))
+        .filter(|app| app.extension().is_some_and(|extension| extension == "app"))
+        .filter_map(|app| codex_build(&app))
+        .max();
+    let Some(staged_build) = staged_build else {
+        return Observation::Clear;
+    };
+    match running_build() {
+        Some(build) if staged_build > build => Observation::Visible,
+        Some(_) => Observation::Clear,
+        None => Observation::Unavailable,
+    }
+}
+
+pub(crate) fn probe(target: UpdateTarget, trusted: bool) -> Observation {
+    if trusted {
+        return probe_accessibility(target);
+    }
+    let Some(cache) = dirs::cache_dir() else {
+        return Observation::Unavailable;
+    };
+    probe_staged_update(
+        &cache.join(CODEX_BUNDLE_ID).join(SPARKLE_INSTALLATION),
+        || {
+            autoreleasepool(|_| {
+                let app =
+                    NSRunningApplication::runningApplicationWithProcessIdentifier(target.pid)?;
+                let path = app.bundleURL()?.to_file_path()?;
+                codex_build(&path)
+            })
+        },
+    )
+}
+
 fn retained(pointer: *const CFType) -> Option<CFRetained<CFType>> {
     // AX Create/Copy functions return owned CoreFoundation objects.
     NonNull::new(pointer.cast_mut()).map(|pointer| unsafe { CFRetained::from_raw(pointer) })
@@ -176,10 +246,7 @@ fn is_update_progress(role: &str) -> bool {
 
 /// Runs off the AppKit thread. Hit testing is restricted to the Codex process,
 /// so our overlaid window does not hide the original control from this query.
-pub(crate) fn probe(target: UpdateTarget) -> Observation {
-    if !is_trusted() {
-        return Observation::Unavailable;
-    }
+fn probe_accessibility(target: UpdateTarget) -> Observation {
     let Some(application) = retained(unsafe { AXUIElementCreateApplication(target.pid) }) else {
         return Observation::Unavailable;
     };
@@ -231,6 +298,7 @@ pub(crate) fn probe(target: UpdateTarget) -> Observation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     const TARGET: UpdateTarget = UpdateTarget {
         pid: 100,
@@ -238,6 +306,76 @@ mod tests {
         x: 146.0,
         y: 736.0,
     };
+
+    fn fixture_bundle(app: &Path, identifier: &str, build: &str) {
+        let contents = app.join("Contents");
+        fs::create_dir_all(&contents).unwrap();
+        fs::write(
+            contents.join("Info.plist"),
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>{identifier}</string>
+<key>CFBundleVersion</key><string>{build}</string>
+</dict></plist>"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_newer_staged_codex_build_hides_quota_until_installation_clears() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "glint-staged-update-{}-{nonce}",
+            std::process::id()
+        ));
+        let installation = root.join("Installation");
+        let payload = installation.join("stage/payload");
+        assert_eq!(
+            probe_staged_update(&installation, || None),
+            Observation::Clear
+        );
+        fixture_bundle(&payload.join("Other.app"), "com.example.other", "999");
+        fixture_bundle(&payload.join("Older.app"), CODEX_BUNDLE_ID, "99");
+        assert_eq!(
+            probe_staged_update(&installation, || Some(100)),
+            Observation::Clear
+        );
+
+        let update = payload.join("ChatGPT.app");
+        fixture_bundle(&update, CODEX_BUNDLE_ID, "101");
+        let now = Instant::now();
+        let mut cache = Cache::default();
+        assert!(!cache.should_yield(TARGET, now));
+        cache.record(
+            TARGET,
+            probe_staged_update(&installation, || Some(100)),
+            now,
+        );
+        assert!(cache.should_yield(TARGET, now));
+        assert_eq!(
+            probe_staged_update(&installation, || Some(101)),
+            Observation::Clear
+        );
+        assert_eq!(
+            probe_staged_update(&installation, || None),
+            Observation::Unavailable
+        );
+
+        fs::remove_dir_all(&update).unwrap();
+        cache.record(
+            TARGET,
+            probe_staged_update(&installation, || Some(100)),
+            now,
+        );
+        assert!(cache.should_yield(TARGET, now));
+        assert!(!cache.should_yield(TARGET, now + RESTORE_DELAY));
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn update_presence_hides_immediately_and_absence_must_settle() {
@@ -308,7 +446,11 @@ mod tests {
         assert!(cache.should_yield(TARGET, now + Duration::from_secs(1)));
         cache.record(TARGET, Observation::Clear, now + Duration::from_secs(2));
         assert!(cache.should_yield(TARGET, now + Duration::from_secs(2)));
-        cache.record(TARGET, Observation::Clear, now + Duration::from_millis(2200));
+        cache.record(
+            TARGET,
+            Observation::Clear,
+            now + Duration::from_millis(2200),
+        );
         assert!(!cache.should_yield(TARGET, now + Duration::from_secs(2) + RESTORE_DELAY));
     }
 

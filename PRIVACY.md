@@ -6,7 +6,7 @@ The quota process reads the existing Codex authentication file under `CODEX_HOME
 
 Reset-credit redemption is only initiated by clicking the count and confirming. It uses a locally installed Codex CLI's App Server protocol. An idempotency key and selected credit identifier are stored locally to support safe retries; uncertain results are not treated as successful resets.
 
-The main widget observes running applications and Codex window bounds for placement. It does not take screenshots or read conversations. If Accessibility permission was granted separately, it checks the role and label of the overlapping update control; it never asks for that permission automatically. Without that permission, the optional update-control avoidance cannot be guaranteed.
+The main widget observes running applications and Codex window bounds for placement. It does not take screenshots or read conversations. If Accessibility permission was granted separately, it checks the role and label of the overlapping update control; it never asks for that permission automatically. Otherwise it compares the bundle identifier and build number of the running app and any staged Codex updater bundles. It does not modify the updater cache or trigger updates.
 
 A per-user LaunchAgent runs the same executable in `--watch` mode. This path is evaluated before Tauri/WebKit starts. The watcher checks running applications about every two seconds, launches only its installed Glint bundle when Codex is running, and terminates only that bundle's main process when Codex exits. It does not initialize the quota network client or read account files.
 
