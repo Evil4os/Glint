@@ -1,7 +1,9 @@
 :where(.quota-widget, .quota-halo-surface) {
+  --paint-mask: radial-gradient(circle closest-side, #000 44%, #000e 60%, #0008 76%, #0002 92%, transparent);
+}
+:where(.quota-widget, .quota-halo-surface).is-expanded {
   --paint-mask-stops: transparent, #0003 5%, #000c 13%, #000 18%, #000 82%, #000c 87%, #0003 95%, transparent;
-  --paint-mask-x: linear-gradient(to right, var(--paint-mask-stops));
-  --paint-mask-y: linear-gradient(to bottom, var(--paint-mask-stops));
+  --paint-mask: linear-gradient(to right, var(--paint-mask-stops)), linear-gradient(to bottom, var(--paint-mask-stops));
 }
 .quota-widget {
   --panel-size: 288px;
@@ -47,10 +49,10 @@
   transform-origin: center;
   transition: transform 300ms cubic-bezier(.2, .88, .24, 1);
 }
-/* Feather the local paint on all four sides, including when the companion
-   surface hasn't drawn yet. The mask scales with the cloud during expansion. */
+/* Keep a soft falloff even when the companion window hasn't drawn yet.
+   The collapsed badge and the expanded panel share their masks with the halo. */
 .quota-widget:not(.quota-halo-core) .quota-widget-cloud {
-  mask-image: var(--paint-mask-x), var(--paint-mask-y);
+  mask-image: var(--paint-mask);
   mask-composite: intersect;
 }
 /* A web backdrop filter cannot blur another native window. Concentrate the
@@ -110,12 +112,12 @@
   pointer-events: none;
 }
 .quota-widget:not(.is-expanded) .quota-widget-cloud::before {
-  /* An 88 × 84 pt field at the docked scale leaves room for a soft, faint
-     tail. The 52 pt input target stays independent of the painted halo. */
+  /* Center a circular field behind the number, with faint color beyond the
+     52 pt click target. */
   left: 50%;
-  top: 54%;
-  width: 169.230769%;
-  height: 161.538462%;
+  top: 50%;
+  width: 138%;
+  height: 138%;
   filter: blur(7px);
 }
 .quota-halo-surface {
@@ -131,7 +133,7 @@
     var(--native-halo-bottom, 0px) var(--native-halo-left, 0px));
   /* Subtract the widget's feathered mask from the halo. At the window edge,
      the widget is fully transparent and the halo carries the entire gradient. */
-  mask-image: linear-gradient(black, black), var(--paint-mask-x), var(--paint-mask-y);
+  mask-image: linear-gradient(black, black), var(--paint-mask);
   mask-size: 100% 100%, var(--halo-core-size) var(--halo-core-size), var(--halo-core-size) var(--halo-core-size);
   mask-position: 0 0, left var(--halo-padding) bottom var(--halo-padding), left var(--halo-padding) bottom var(--halo-padding);
   mask-repeat: no-repeat;
